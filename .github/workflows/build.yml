@@ -6,6 +6,9 @@ on:
 jobs:
   build:
     runs-on: macos-latest
+    defaults:
+      run:
+        working-directory: CadCamStock-repo
     steps:
       - uses: actions/checkout@v4
       - name: Install XcodeGen
@@ -28,9 +31,9 @@ jobs:
       - uses: actions/upload-artifact@v4
         with:
           name: CadCamStock-ipa
-          path: CadCamStock.ipa
+          path: CadCamStock-repo/CadCamStock.ipa
       - uses: actions/upload-artifact@v4
         if: failure()
         with:
           name: build-log
-          path: build.log
+          path: CadCamStock-repo/build.log
