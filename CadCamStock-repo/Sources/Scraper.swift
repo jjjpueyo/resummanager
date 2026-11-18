@@ -30,6 +30,7 @@ final class Scraper: NSObject, ObservableObject {
         cfg.websiteDataStore = .default()   // guarda les galetes de sessió
         webView = WKWebView(frame: CGRect(x: 0, y: 0, width: 390, height: 800), configuration: cfg)
         super.init()
+        webView.uiDelegate = self
     }
 
     // MARK: - Flux principal
@@ -68,7 +69,7 @@ final class Scraper: NSObject, ObservableObject {
     // El login té reCAPTCHA. Primer provem d'omplir-lo i prémer el botó automàticament;
     // si no entra en ~15 s, mostrem la web perquè facis el login a mà (un cop).
     private func ensureLoggedIn() async throws {
-        var submittedAt: Int? = nil, navigated = false
+        var submittedAt: Int? = nil, lastPortal = -100, portalDone = false, portalTries = 0
         defer { needsManualLogin = false }
         for i in 0..<240 {                                  // ~2 min
             let s = (try? await js(Self.stateJS)) as? String ?? "wait"
@@ -77,6 +78,7 @@ final class Scraper: NSObject, ObservableObject {
             case "login":
                 if submittedAt == nil {
                     if let u = Keychain.get("user"), let p = Keychain.get("pass") {
+                        status = "Enviant el login…"
                         _ = try? await js("""
                         (() => {
                           const set = (sel, v) => { const e = document.querySelector(sel);
@@ -95,14 +97,32 @@ final class Scraper: NSObject, ObservableObject {
                     needsManualLogin = true                 // el reCAPTCHA no ha deixat: login manual
                 }
                 if needsManualLogin { status = "Fes login a la web que apareix" }
-            case "other" where submittedAt != nil && !navigated:
-                webView.load(URLRequest(url: Config.cadcamURL))
-                navigated = true
+            case "other" where submittedAt != nil:
+                // Després del login surt el portal d'icones: entrem a CADCAM MANAGER (enllaç /CCManager).
+                if i - lastPortal > 20 || (!portalDone && i - lastPortal > 4) {
+                    lastPortal = i
+                    status = "Entrant a CadCam Manager…"
+                    if !portalDone {
+                        let r = (try? await js(Self.portalJS)) as? String ?? "none"
+                        if r.hasPrefix("href:"), let u = URL(string: String(r.dropFirst(5))) {
+                            portalDone = true
+                            webView.load(URLRequest(url: u))
+                        } else if r == "clicked" {
+                            portalDone = true
+                        } else {
+                            portalTries += 1                       // el portal potser encara no ha pintat les icones
+                            if portalTries >= 3 { portalDone = true; webView.load(URLRequest(url: Config.cadcamURL)) }
+                        }
+                    } else {
+                        // Ja hem passat pel portal: ara sí, anem a la pàgina de fases
+                        webView.load(URLRequest(url: Config.cadcamURL))
+                    }
+                }
             default: break
             }
             try await Task.sleep(nanoseconds: 500_000_000)
         }
-        throw ScrapeError(message: "Temps d'espera esgotat (login o xarxa/VPN)")
+        throw ScrapeError(message: "Temps d'espera esgotat. Última pàgina: \(webView.url?.host ?? "cap")\(webView.url?.path ?? "")")
     }
 
     // MARK: - Canvi de centre
@@ -143,6 +163,23 @@ final class Scraper: NSObject, ObservableObject {
     }
 
     // MARK: - Utilitats
+    private static let portalJS = """
+    (() => {
+      let a = document.querySelector('a[href="/CCManager"], a[href*="CCManager" i]');
+      if (!a) {
+        const els = [...document.querySelectorAll('a,div,span,button,li,td')]
+          .filter(e => /cadcam\\s*manager/i.test(e.textContent || '') && (e.textContent || '').length < 60);
+        if (!els.length) return 'none';
+        const el = els[els.length - 1];
+        a = el.closest('a') || el.querySelector('a');
+        if (!a) { el.click(); return 'clicked'; }
+      }
+      if (a.href && !/^javascript/i.test(a.href)) return 'href:' + a.href;
+      a.click();
+      return 'clicked';
+    })()
+    """
+
     private static let stateJS = """
     (() => {
       if (document.readyState !== 'complete') return 'wait';
@@ -169,4 +206,13 @@ struct HiddenWebView: UIViewRepresentable {
     let webView: WKWebView
     func makeUIView(context: Context) -> WKWebView { webView }
     func updateUIView(_ uiView: WKWebView, context: Context) {}
+}
+
+// Si la web obre una pestanya nova, la carreguem dins la mateixa vista.
+extension Scraper: WKUIDelegate {
+    func webView(_ webView: WKWebView, createWebViewWith configuration: WKWebViewConfiguration,
+                 for navigationAction: WKNavigationAction, windowFeatures: WKWindowFeatures) -> WKWebView? {
+        if navigationAction.targetFrame == nil { webView.load(navigationAction.request) }
+        return nil
+    }
 }
