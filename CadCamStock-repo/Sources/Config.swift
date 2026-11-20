@@ -7,13 +7,20 @@ enum Config {
     static let cadcamURL = URL(string: "https://srv-ccmanager.phibo.com:27015/Fases/PhiboGrids/Titanio/Programacion.aspx")!
 
     // Selectors del login (tots confirmats)
-    static let userSelector = "#Username"                 // confirmat
-    static let passSelector = "#Password"                 // confirmat
-    static let buttonSelector = "#SubmitForm"            // botó "Log in" (confirmat)
+    static let userSelector = "#Username"
+    static let passSelector = "#Password"
+    static let buttonSelector = "#SubmitForm"
 
     // Ja confirmats
     static let comboId = "ctl00_CboCentroProductivo"
     static let menuPrefix = "cpl_menu_sup_derecha_menuFases_"
+
+    // Zirconi per màquina (pàgina Fase Mecanizado de Zirconio, pestanya "Disponibles")
+    static let trackMachines = true
+    static let machineCenter = "Ourense"
+    static let machinesURL = URL(string: "https://srv-ccmanager.phibo.com:27015/Fases/PhiboGrids/Zirconio/ZrFaseProd.aspx")!
+    static let machineGrid = "ContentPlaceHolder1_PhgDisponibles"   // PhgPendientes / PhgTodos per a les altres pestanyes
+    static let machineNames = ["IMES", "DATRON"]
 
     struct Center { let name: String; let materials: [String] }
     static let centers = [
