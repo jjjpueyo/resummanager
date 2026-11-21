@@ -13,21 +13,44 @@ struct CenterResult: Identifiable, Codable {
 struct MachineStat: Codable, Identifiable {
     var machine: String
     var pieces: Int      // suma de "Nº Piezas"
-    var cases: Int       // nombre de files (casos)
+    var cases: Int       // nombre de fitxers (files)
     var id: String { machine }
 }
 struct MachineSummary: Codable {
     var stats: [MachineStat]
     var date: Date
+    var pageCounts: [Int]?     // fitxers llegits a cada pàgina (per diagnosticar)
 }
+struct ProgrammerStat: Codable, Identifiable {
+    var initials: String
+    var counts: [String: Int]  // clau de l'Scan -> fitxers programats
+    var id: String { initials }
+    var total: Int { counts.values.reduce(0, +) }
+}
+struct ProgrammerSummary: Codable {
+    var stats: [ProgrammerStat]
+    var date: Date
+}
+private struct GridRow { var machine: String; var pieces: Int; var prog: String }
 private struct GridPage {
+    var found: Bool
     var sig: String
-    var rows: [(String, Int)]
-    var pages: [Int]
+    var rows: [GridRow]
     var hasPiezas: Bool
     var debug: String
 }
-private struct Cache: Codable { var date: Date; var results: [CenterResult]; var machines: MachineSummary? }
+private struct ScanResult {
+    var rows: [GridRow]
+    var pageCounts: [Int]
+    var hasPiezas: Bool
+    var debug: String
+}
+private struct Cache: Codable {
+    var date: Date
+    var results: [CenterResult]
+    var machines: MachineSummary?
+    var programmers: ProgrammerSummary?
+}
 
 struct ScrapeError: LocalizedError {
     let message: String
@@ -42,6 +65,8 @@ final class Scraper: NSObject, ObservableObject {
     @Published var lastUpdate: Date?
     @Published var machines: MachineSummary?
     @Published var machinesNote = ""
+    @Published var programmers: ProgrammerSummary?
+    @Published var programmersNote = ""
     @Published var needsManualLogin = false   // mostra la web perquè facis login tu
 
     let webView: WKWebView
@@ -59,6 +84,7 @@ final class Scraper: NSObject, ObservableObject {
             results = c.results
             lastUpdate = c.date
             machines = c.machines
+            programmers = c.programmers
         }
     }
 
@@ -98,18 +124,9 @@ final class Scraper: NSObject, ObservableObject {
             saveCache()
             status = ""
 
-            // Zirconi per màquina (en segon pla: els números de dalt ja es veuen)
-            if Config.trackMachines {
-                status = "Llegint màquines de Zirconi…"
-                machinesNote = ""
-                do {
-                    let stats = try await readMachines()
-                    machines = MachineSummary(stats: stats, date: Date())
-                    saveCache()
-                } catch {
-                    machinesNote = error.localizedDescription
-                }
-                status = ""
+            // Taules de Fase Mecanitzat: màquines de Zirconi + programadors (en segon pla, els números de dalt ja es veuen)
+            if Config.trackMachines || Config.trackProgrammers {
+                await scanAll()
             }
         } catch {
             status = error.localizedDescription
@@ -213,64 +230,137 @@ final class Scraper: NSObject, ObservableObject {
         return obj.mapValues { $0 as? Int }
     }
 
-    // MARK: - Zirconi per màquina
+    // MARK: - Taules de Fase Mecanitzat (màquines de Zirconi + programadors)
     private func saveCache() {
         guard let d = lastUpdate,
-              let enc = try? JSONEncoder().encode(Cache(date: d, results: results, machines: machines)) else { return }
+              let enc = try? JSONEncoder().encode(Cache(date: d, results: results, machines: machines, programmers: programmers)) else { return }
         UserDefaults.standard.set(enc, forKey: "cache")
     }
 
-    private func readMachines() async throws -> [MachineStat] {
-        if await currentCenter() != Config.machineCenter { try await switchCenter(to: Config.machineCenter) }
+    private func expectedFiles(_ scan: Config.Scan) -> Int? {
+        results.first { $0.id == scan.center }?.materials.first { $0.id == scan.material }?.mec
+    }
+
+    private func scanAll() async {
+        machinesNote = ""
+        programmersNote = ""
+        let here = await currentCenter()
+        var currentC = here ?? ""
+        let ordered = Config.scans.filter { $0.center == here } + Config.scans.filter { $0.center != here }
+        var rowsByKey: [String: [GridRow]] = [:]
+        var notes: [String] = []
+        var zrPages: [Int] = []
+
+        for scan in ordered {
+            status = "Llegint \(scan.label)…"
+            do {
+                if scan.center != currentC {
+                    try await goToMainPage()            // el selector de centre és a la pàgina d'entrada
+                    try await switchCenter(to: scan.center)
+                    currentC = scan.center
+                }
+                let r = try await scanGrid(scan.url)
+                rowsByKey[scan.key] = r.rows
+                if scan.key == Config.zirconiKey {
+                    zrPages = r.pageCounts
+                    if !r.hasPiezas && !r.rows.isEmpty {
+                        machinesNote = "No trobo la columna «Nº Piezas». " + String(r.debug.prefix(300))
+                    }
+                }
+                if let e = expectedFiles(scan), e != r.rows.count {
+                    var m = "\(scan.label): he llegit \(r.rows.count) fitxers i el menú en diu \(e)."
+                    if !r.pageCounts.isEmpty { m += " Per pàgines: " + r.pageCounts.map(String.init).joined(separator: " + ") }
+                    notes.append(m)
+                }
+            } catch {
+                notes.append("\(scan.label): \(error.localizedDescription)")
+                if scan.key == Config.zirconiKey { machinesNote = error.localizedDescription }
+            }
+        }
+
+        // Zirconi: peces per màquina
+        if Config.trackMachines, let zr = rowsByKey[Config.zirconiKey] {
+            var map: [String: MachineStat] = [:]
+            for r in zr {
+                var st = map[r.machine] ?? MachineStat(machine: r.machine, pieces: 0, cases: 0)
+                st.pieces += r.pieces
+                st.cases += 1
+                map[r.machine] = st
+            }
+            var out = Config.machineNames.map { map[$0] ?? MachineStat(machine: $0, pieces: 0, cases: 0) }
+            out += map.values.filter { !Config.machineNames.contains($0.machine) }.sorted { $0.machine < $1.machine }
+            machines = MachineSummary(stats: out, date: Date(), pageCounts: zrPages)
+        }
+
+        // Programadors: fitxers per inicials i per material/centre
+        if Config.trackProgrammers && !rowsByKey.isEmpty {
+            var byProg: [String: [String: Int]] = [:]
+            for (key, rows) in rowsByKey {
+                for r in rows where !r.prog.isEmpty {
+                    byProg[r.prog, default: [:]][key, default: 0] += 1
+                }
+            }
+            let stats = byProg.map { ProgrammerStat(initials: $0.key, counts: $0.value) }
+                .sorted { ($0.total, $1.initials) > ($1.total, $0.initials) }
+            programmers = ProgrammerSummary(stats: stats, date: Date())
+        }
+
+        programmersNote = notes.joined(separator: "\n")
+        saveCache()
+        status = ""
+    }
+
+    private func goToMainPage() async throws {
         _ = try? await js("window.__stale = 1")
-        webView.load(URLRequest(url: Config.machinesURL))
+        webView.load(URLRequest(url: Config.cadcamURL))
+        for _ in 0..<200 {
+            try await Task.sleep(nanoseconds: 150_000_000)
+            let st = (try? await js(Self.stateJS)) as? String
+            if st == "app" { return }
+        }
+        throw ScrapeError(message: "No he pogut tornar a la pàgina principal")
+    }
 
+    /// Carrega una pàgina de Fase Mecanizado i en llegeix totes les pàgines de la taula (de 20 en 20).
+    private func scanGrid(_ url: URL) async throws -> ScanResult {
+        _ = try? await js("window.__stale = 1")
+        webView.load(URLRequest(url: url))
         var page = try await waitForGrid()
-        if page.rows.isEmpty { return Config.machineNames.map { MachineStat(machine: $0, pieces: 0, cases: 0) } }
-        guard page.hasPiezas else { throw ScrapeError(message: "No trobo la columna «Nº Piezas». " + String(page.debug.prefix(400))) }
+        if !page.found { return ScanResult(rows: [], pageCounts: [], hasPiezas: false, debug: "") }
 
+        let first = page
         var all = page.rows
-        // Va passant a la pàgina següent fins que no n'hi ha més (de 20 en 20: funciona amb 1, 3 o 15 pàgines).
+        var counts = [page.rows.count]
         var n = 2
         while n <= 80 {
             let r = (try? await js(clickPageJS(n))) as? String
-            if r != "ok" { break }                               // no hi ha pàgina n: hem acabat
-            status = "Llegint màquines (pàgina \(n))…"
+            if r != "ok" { break }                                   // no hi ha pàgina n: hem acabat
             page = try await waitForNewPage(after: page.sig)
             all += page.rows
+            counts.append(page.rows.count)
             n += 1
         }
-
-        var map: [String: MachineStat] = [:]
-        for (m, p) in all {
-            var st = map[m] ?? MachineStat(machine: m, pieces: 0, cases: 0)
-            st.pieces += p
-            st.cases += 1
-            map[m] = st
-        }
-        var out = Config.machineNames.map { map[$0] ?? MachineStat(machine: $0, pieces: 0, cases: 0) }
-        out += map.values.filter { !Config.machineNames.contains($0.machine) }.sorted { $0.machine < $1.machine }
-        return out
+        return ScanResult(rows: all, pageCounts: counts, hasPiezas: first.hasPiezas, debug: first.debug)
     }
 
     private func waitForGrid() async throws -> GridPage {
         var nogrid = 0
-        for _ in 0..<200 {                                       // ~30 s
+        for _ in 0..<200 {                                           // ~30 s
             try await Task.sleep(nanoseconds: 150_000_000)
             let st = (try? await js(gridStateJS)) as? String ?? "wait"
-            if st == "grid", let p = await readGridPage(), !p.rows.isEmpty { return p }
+            if st == "grid", let p = await readGridPage(), p.found, !p.rows.isEmpty { return p }
             if st == "nogrid" {
                 nogrid += 1
-                if nogrid > 25 { return GridPage(sig: "", rows: [], pages: [], hasPiezas: true, debug: "") }   // taula buida
+                if nogrid > 25 { return GridPage(found: false, sig: "", rows: [], hasPiezas: false, debug: "") }   // taula buida o no trobada
             } else { nogrid = 0 }
         }
-        throw ScrapeError(message: "No he pogut llegir la taula de màquines")
+        throw ScrapeError(message: "No he pogut llegir la taula")
     }
 
     private func waitForNewPage(after sig: String) async throws -> GridPage {
-        for _ in 0..<150 {                                       // ~22 s
+        for _ in 0..<150 {                                           // ~22 s
             try await Task.sleep(nanoseconds: 150_000_000)
-            if let p = await readGridPage(), !p.rows.isEmpty, p.sig != sig { return p }
+            if let p = await readGridPage(), p.found, !p.rows.isEmpty, p.sig != sig { return p }
         }
         throw ScrapeError(message: "No he pogut canviar de pàgina a la taula")
     }
@@ -280,73 +370,78 @@ final class Scraper: NSObject, ObservableObject {
               let obj = (try? JSONSerialization.jsonObject(with: Data(json.utf8))) as? [String: Any],
               let sig = obj["sig"] as? String,
               let raw = obj["rows"] as? [[Any]] else { return nil }
-        let rows: [(String, Int)] = raw.compactMap { r -> (String, Int)? in
-            guard r.count == 2, let m = r[0] as? String, let p = r[1] as? Int else { return nil }
-            return (m, p)
+        let rows: [GridRow] = raw.compactMap { r -> GridRow? in
+            guard r.count == 3, let m = r[0] as? String, let p = r[1] as? Int, let g = r[2] as? String else { return nil }
+            return GridRow(machine: m, pieces: p, prog: g)
         }
-        return GridPage(sig: sig, rows: rows, pages: obj["pages"] as? [Int] ?? [], hasPiezas: obj["hasPiezas"] as? Bool ?? false, debug: obj["debug"] as? String ?? "")
+        return GridPage(found: obj["found"] as? Bool ?? false, sig: sig, rows: rows,
+                        hasPiezas: obj["hasPiezas"] as? Bool ?? false, debug: obj["debug"] as? String ?? "")
+    }
+
+    /// Nom del control tal com surt als enllaços de pàgina: ContentPlaceHolder1$PhgDisponibles$GvwGrid
+    private var gridPostbackName: String {
+        Config.machineGrid.replacingOccurrences(of: "_", with: "$") + "$GvwGrid"
     }
 
     private var gridStateJS: String { """
     (() => {
       if (window.__stale === 1) return 'wait';
       if (document.readyState !== 'complete') return 'wait';
-      if (document.querySelector('[id^="\(Config.machineGrid)"][id*="TipoMaquina_"]')) return 'grid';
-      if (document.getElementById('\(Config.menuPrefix)ZirconioProd')) return 'nogrid';
+      const G = '\(Config.machineGrid)_GvwGrid_';
+      const has = [...document.querySelectorAll('[id^="' + G + '"]')].some(e => /_(TipoMaquina|ProgFirma)_[0-9]+$/.test(e.id));
+      if (has) return 'grid';
+      if (document.getElementById('\(Config.comboId)')) return 'nogrid';
       return 'wait';
     })()
     """ }
 
+    /// Llegeix NOMÉS les files reals de la taula (ids ..._GvwGrid_TipoMaquina_0, ..._GvwGrid_ProgFirma_0, …).
     private var gridReadJS: String { """
     (() => {
-      const spans = [...document.querySelectorAll('[id^="\(Config.machineGrid)"][id*="TipoMaquina_"]')];
-      if (!spans.length) return JSON.stringify({sig: '', rows: [], pages: [], hasPiezas: true, debug: ''});
-      const table = spans[0].closest('table');
+      const G = '\(Config.machineGrid)_GvwGrid_';
+      const rx = new RegExp('^' + G + '(TipoMaquina|ProgFirma)_[0-9]+$');
       const num = t => { const n = parseInt((t || '').replace(/[^0-9]/g, '')); return isNaN(n) ? null : n; };
 
-      // Columna "Nº Piezas": (1) capçalera dins la mateixa taula, (2) capçalera en qualsevol lloc de la pàgina
+      const trs = [];
+      document.querySelectorAll('[id^="' + G + '"]').forEach(e => {
+        if (rx.test(e.id)) { const tr = e.closest('tr'); if (tr && trs.indexOf(tr) < 0) trs.push(tr); }
+      });
+      if (!trs.length) return JSON.stringify({found: false, sig: '', rows: [], hasPiezas: false, debug: ''});
+
+      const table = trs[0].closest('table');
       let idx = -1;
-      const head = [...table.rows].find(r => !r.querySelector('[id*="TipoMaquina_"]') &&
-                                             [...r.children].some(c => /piezas/i.test(c.textContent)));
+      const head = [...table.rows].find(r => trs.indexOf(r) < 0 && [...r.children].some(c => /piezas/i.test(c.textContent)));
       if (head) idx = [...head.children].findIndex(c => /piezas/i.test(c.textContent));
-      if (idx < 0) {
-        const hc = [...document.querySelectorAll('th,td')]
-          .find(c => !c.querySelector('td,th') && /^\\s*n?[º°o.]?\\s*piezas\\s*$/i.test(c.textContent));
-        if (hc) idx = [...hc.parentElement.children].indexOf(hc);
-      }
 
       let ok = false;
-      const rows = spans.map(sp => {
-        const tr = sp.closest('tr');
+      const rows = trs.map(tr => {
+        const get = name => {
+          const el = tr.querySelector('[id^="' + G + name + '_"]');
+          return el ? (el.textContent || '').trim().toUpperCase() : '';
+        };
         let n = null;
-        // (3) element de la mateixa fila amb "pieza" a l'id (el més directe)
         const el = tr.querySelector('[id*="pieza" i]');
         if (el) n = num(el.textContent);
         if (n === null && idx >= 0 && tr.children[idx]) n = num(tr.children[idx].textContent);
         if (n !== null) ok = true;
-        return [sp.textContent.trim().toUpperCase(), n === null ? 0 : n];
+        return [get('TipoMaquina'), n === null ? 0 : n, get('ProgFirma')];
       });
 
-      const pages = [...new Set([...table.querySelectorAll('a')]
-        .map(a => (a.getAttribute('href') || '').match(/Page[$]([0-9]+)/))
-        .filter(m => m).map(m => parseInt(m[1])))].sort((a, b) => a - b);
-      const first = spans[0].closest('tr').textContent.replace(/\\s+/g, ' ');
-      const last = spans[spans.length - 1].closest('tr').textContent.replace(/\\s+/g, ' ');
-
-      const tr0 = spans[0].closest('tr');
-      const ids = [...tr0.querySelectorAll('[id]')].map(e => e.id.split('_').slice(-2).join('_')).join(',');
-      const cells = [...tr0.children].map(c => (c.textContent || '').trim().slice(0, 10)).join('/');
-      const debug = 'ids: ' + ids + ' | cel·les: ' + cells + ' | idx=' + idx;
-
-      return JSON.stringify({sig: rows.length + '|' + first + '|' + last, rows, pages, hasPiezas: ok, debug});
+      const txt = tr => tr.textContent.replace(/\\s+/g, ' ');
+      const sig = rows.length + '|' + txt(trs[0]) + '|' + txt(trs[trs.length - 1]);
+      const ids = [...trs[0].querySelectorAll('[id]')].map(e => e.id.split('_').slice(-2).join('_')).join(',');
+      const cells = [...trs[0].children].map(c => (c.textContent || '').trim().slice(0, 10)).join('/');
+      return JSON.stringify({found: true, sig, rows, hasPiezas: ok, debug: 'ids: ' + ids + ' | cel·les: ' + cells + ' | idx=' + idx});
     })()
     """ }
 
     private func clickPageJS(_ n: Int) -> String { """
     (() => {
-      const sp = document.querySelector('[id^="\(Config.machineGrid)"][id*="TipoMaquina_"]');
-      const scope = sp ? sp.closest('table') : document;
-      const a = [...scope.querySelectorAll('a')].find(x => (x.getAttribute('href') || '').indexOf("Page$\(n)'") > -1);
+      const H = '\(gridPostbackName)';
+      const a = [...document.querySelectorAll('a')].find(x => {
+        const h = x.getAttribute('href') || '';
+        return h.indexOf(H) > -1 && h.indexOf("Page$\(n)'") > -1;
+      });
       if (!a) return 'none';
       a.click();
       return 'ok';
