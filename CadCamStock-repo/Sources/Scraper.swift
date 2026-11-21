@@ -25,6 +25,7 @@ private struct GridPage {
     var rows: [(String, Int)]
     var pages: [Int]
     var hasPiezas: Bool
+    var debug: String
 }
 private struct Cache: Codable { var date: Date; var results: [CenterResult]; var machines: MachineSummary? }
 
@@ -226,7 +227,7 @@ final class Scraper: NSObject, ObservableObject {
 
         var page = try await waitForGrid()
         if page.rows.isEmpty { return Config.machineNames.map { MachineStat(machine: $0, pieces: 0, cases: 0) } }
-        guard page.hasPiezas else { throw ScrapeError(message: "No trobo la columna «Nº Piezas»") }
+        guard page.hasPiezas else { throw ScrapeError(message: "No trobo la columna «Nº Piezas». " + String(page.debug.prefix(400))) }
 
         var all = page.rows
         // Va passant a la pàgina següent fins que no n'hi ha més (de 20 en 20: funciona amb 1, 3 o 15 pàgines).
@@ -260,7 +261,7 @@ final class Scraper: NSObject, ObservableObject {
             if st == "grid", let p = await readGridPage(), !p.rows.isEmpty { return p }
             if st == "nogrid" {
                 nogrid += 1
-                if nogrid > 25 { return GridPage(sig: "", rows: [], pages: [], hasPiezas: true) }   // taula buida
+                if nogrid > 25 { return GridPage(sig: "", rows: [], pages: [], hasPiezas: true, debug: "") }   // taula buida
             } else { nogrid = 0 }
         }
         throw ScrapeError(message: "No he pogut llegir la taula de màquines")
@@ -283,7 +284,7 @@ final class Scraper: NSObject, ObservableObject {
             guard r.count == 2, let m = r[0] as? String, let p = r[1] as? Int else { return nil }
             return (m, p)
         }
-        return GridPage(sig: sig, rows: rows, pages: obj["pages"] as? [Int] ?? [], hasPiezas: obj["hasPiezas"] as? Bool ?? false)
+        return GridPage(sig: sig, rows: rows, pages: obj["pages"] as? [Int] ?? [], hasPiezas: obj["hasPiezas"] as? Bool ?? false, debug: obj["debug"] as? String ?? "")
     }
 
     private var gridStateJS: String { """
@@ -299,23 +300,45 @@ final class Scraper: NSObject, ObservableObject {
     private var gridReadJS: String { """
     (() => {
       const spans = [...document.querySelectorAll('[id^="\(Config.machineGrid)"][id*="TipoMaquina_"]')];
-      if (!spans.length) return JSON.stringify({sig: '', rows: [], pages: [], hasPiezas: true});
+      if (!spans.length) return JSON.stringify({sig: '', rows: [], pages: [], hasPiezas: true, debug: ''});
       const table = spans[0].closest('table');
+      const num = t => { const n = parseInt((t || '').replace(/[^0-9]/g, '')); return isNaN(n) ? null : n; };
+
+      // Columna "Nº Piezas": (1) capçalera dins la mateixa taula, (2) capçalera en qualsevol lloc de la pàgina
+      let idx = -1;
       const head = [...table.rows].find(r => !r.querySelector('[id*="TipoMaquina_"]') &&
                                              [...r.children].some(c => /piezas/i.test(c.textContent)));
-      const idx = head ? [...head.children].findIndex(c => /piezas/i.test(c.textContent)) : -1;
+      if (head) idx = [...head.children].findIndex(c => /piezas/i.test(c.textContent));
+      if (idx < 0) {
+        const hc = [...document.querySelectorAll('th,td')]
+          .find(c => !c.querySelector('td,th') && /^\\s*n?[º°o.]?\\s*piezas\\s*$/i.test(c.textContent));
+        if (hc) idx = [...hc.parentElement.children].indexOf(hc);
+      }
+
+      let ok = false;
       const rows = spans.map(sp => {
         const tr = sp.closest('tr');
-        const cell = idx >= 0 ? tr.children[idx] : null;
-        const n = cell ? parseInt(cell.textContent.replace(/[^0-9]/g, '')) : NaN;
-        return [sp.textContent.trim().toUpperCase(), isNaN(n) ? 0 : n];
+        let n = null;
+        // (3) element de la mateixa fila amb "pieza" a l'id (el més directe)
+        const el = tr.querySelector('[id*="pieza" i]');
+        if (el) n = num(el.textContent);
+        if (n === null && idx >= 0 && tr.children[idx]) n = num(tr.children[idx].textContent);
+        if (n !== null) ok = true;
+        return [sp.textContent.trim().toUpperCase(), n === null ? 0 : n];
       });
+
       const pages = [...new Set([...table.querySelectorAll('a')]
         .map(a => (a.getAttribute('href') || '').match(/Page[$]([0-9]+)/))
         .filter(m => m).map(m => parseInt(m[1])))].sort((a, b) => a - b);
       const first = spans[0].closest('tr').textContent.replace(/\\s+/g, ' ');
       const last = spans[spans.length - 1].closest('tr').textContent.replace(/\\s+/g, ' ');
-      return JSON.stringify({sig: rows.length + '|' + first + '|' + last, rows, pages, hasPiezas: idx >= 0});
+
+      const tr0 = spans[0].closest('tr');
+      const ids = [...tr0.querySelectorAll('[id]')].map(e => e.id.split('_').slice(-2).join('_')).join(',');
+      const cells = [...tr0.children].map(c => (c.textContent || '').trim().slice(0, 10)).join('/');
+      const debug = 'ids: ' + ids + ' | cel·les: ' + cells + ' | idx=' + idx;
+
+      return JSON.stringify({sig: rows.length + '|' + first + '|' + last, rows, pages, hasPiezas: ok, debug});
     })()
     """ }
 
