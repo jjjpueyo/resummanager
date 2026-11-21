@@ -259,10 +259,13 @@ final class Scraper: NSObject, ObservableObject {
                     try await switchCenter(to: scan.center)
                     currentC = scan.center
                 }
-                let r = try await scanGrid(scan.url)
+                let r = try await scanGrid(scan.url, expectRows: (expectedFiles(scan) ?? 1) > 0)
                 rowsByKey[scan.key] = r.rows
                 if scan.key == Config.zirconiKey {
                     zrPages = r.pageCounts
+                    if r.rows.isEmpty && !r.debug.isEmpty {
+                        machinesNote = "No trobo la taula de Zirconi. [" + r.debug + "]"
+                    }
                     if !r.hasPiezas && !r.rows.isEmpty {
                         machinesNote = "No trobo la columna «Nº Piezas». " + String(r.debug.prefix(300))
                     }
@@ -270,6 +273,7 @@ final class Scraper: NSObject, ObservableObject {
                 if let e = expectedFiles(scan), e != r.rows.count {
                     var m = "\(scan.label): he llegit \(r.rows.count) fitxers i el menú en diu \(e)."
                     if !r.pageCounts.isEmpty { m += " Per pàgines: " + r.pageCounts.map(String.init).joined(separator: " + ") }
+                    if r.rows.isEmpty && !r.debug.isEmpty { m += " [" + r.debug + "]" }
                     notes.append(m)
                 }
             } catch {
@@ -322,11 +326,14 @@ final class Scraper: NSObject, ObservableObject {
     }
 
     /// Carrega una pàgina de Fase Mecanizado i en llegeix totes les pàgines de la taula (de 20 en 20).
-    private func scanGrid(_ url: URL) async throws -> ScanResult {
+    private func scanGrid(_ url: URL, expectRows: Bool) async throws -> ScanResult {
         _ = try? await js("window.__stale = 1")
         webView.load(URLRequest(url: url))
-        var page = try await waitForGrid()
-        if !page.found { return ScanResult(rows: [], pageCounts: [], hasPiezas: false, debug: "") }
+        var page = try await waitForGrid(expectRows: expectRows)
+        if !page.found {
+            let dbg = (try? await js(diagJS)) as? String ?? ""
+            return ScanResult(rows: [], pageCounts: [], hasPiezas: false, debug: dbg)
+        }
 
         let first = page
         var all = page.rows
@@ -343,7 +350,8 @@ final class Scraper: NSObject, ObservableObject {
         return ScanResult(rows: all, pageCounts: counts, hasPiezas: first.hasPiezas, debug: first.debug)
     }
 
-    private func waitForGrid() async throws -> GridPage {
+    private func waitForGrid(expectRows: Bool) async throws -> GridPage {
+        let patience = expectRows ? 130 : 20          // ~20 s si el menú diu que hi ha fitxers, ~3 s si no
         var nogrid = 0
         for _ in 0..<200 {                                           // ~30 s
             try await Task.sleep(nanoseconds: 150_000_000)
@@ -351,7 +359,7 @@ final class Scraper: NSObject, ObservableObject {
             if st == "grid", let p = await readGridPage(), p.found, !p.rows.isEmpty { return p }
             if st == "nogrid" {
                 nogrid += 1
-                if nogrid > 25 { return GridPage(found: false, sig: "", rows: [], hasPiezas: false, debug: "") }   // taula buida o no trobada
+                if nogrid > patience { return GridPage(found: false, sig: "", rows: [], hasPiezas: false, debug: "") }   // taula buida o no trobada
             } else { nogrid = 0 }
         }
         throw ScrapeError(message: "No he pogut llegir la taula")
@@ -432,6 +440,17 @@ final class Scraper: NSObject, ObservableObject {
       const ids = [...trs[0].querySelectorAll('[id]')].map(e => e.id.split('_').slice(-2).join('_')).join(',');
       const cells = [...trs[0].children].map(c => (c.textContent || '').trim().slice(0, 10)).join('/');
       return JSON.stringify({found: true, sig, rows, hasPiezas: ok, debug: 'ids: ' + ids + ' | cel·les: ' + cells + ' | idx=' + idx});
+    })()
+    """ }
+
+    /// Què veu l'app quan no troba la taula (per diagnosticar-ho).
+    private var diagJS: String { """
+    (() => {
+      const any = [...document.querySelectorAll('[id*="TipoMaquina"],[id*="ProgFirma"]')].map(e => e.id);
+      const grids = [...new Set([...document.querySelectorAll('[id*="_GvwGrid"]')].map(e => e.id.split('_GvwGrid')[0]))];
+      return 'pàgina ' + location.pathname.split('/').slice(-2).join('/') + ' · títol «' + (document.title || '').slice(0, 30) +
+             '» · taules: ' + (grids.slice(0, 4).join(', ') || 'cap') +
+             ' · ids Prog/Màq: ' + (any.slice(0, 3).join(', ') || 'cap');
     })()
     """ }
 
