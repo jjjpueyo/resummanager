@@ -7,9 +7,9 @@ enum Config {
     static let cadcamURL = URL(string: "https://srv-ccmanager.phibo.com:27015/Fases/PhiboGrids/Titanio/Programacion.aspx")!
 
     // Selectors del login (tots confirmats)
-    static let userSelector = "#Username"
-    static let passSelector = "#Password"
-    static let buttonSelector = "#SubmitForm"
+    static let userSelector = "#Username"                 // confirmat
+    static let passSelector = "#Password"                 // confirmat
+    static let buttonSelector = "#SubmitForm"            // botó "Log in" (confirmat)
 
     // Ja confirmats
     static let comboId = "ctl00_CboCentroProductivo"
