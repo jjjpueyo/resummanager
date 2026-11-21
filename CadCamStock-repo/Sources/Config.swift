@@ -2,25 +2,41 @@ import Foundation
 
 // Tots els valors d'aquest fitxer ja estan confirmats amb la teva web.
 enum Config {
-    // Pàgina d'entrada. Fem servir Titanio perquè existeix tant a España com a Ourense
-    // (la de Zirconio podria no carregar quan el centre actual és España).
+    // Pàgina d'entrada. Fem servir Titanio perquè existeix tant a España com a Ourense.
     static let cadcamURL = URL(string: "https://srv-ccmanager.phibo.com:27015/Fases/PhiboGrids/Titanio/Programacion.aspx")!
 
-    // Selectors del login (tots confirmats)
-    static let userSelector = "#Username"                 // confirmat
-    static let passSelector = "#Password"                 // confirmat
-    static let buttonSelector = "#SubmitForm"            // botó "Log in" (confirmat)
+    // Selectors del login
+    static let userSelector = "#Username"
+    static let passSelector = "#Password"
+    static let buttonSelector = "#SubmitForm"
 
-    // Ja confirmats
     static let comboId = "ctl00_CboCentroProductivo"
     static let menuPrefix = "cpl_menu_sup_derecha_menuFases_"
 
-    // Zirconi per màquina (pàgina Fase Mecanizado de Zirconio, pestanya "Disponibles")
-    static let trackMachines = true
-    static let machineCenter = "Ourense"
-    static let machinesURL = URL(string: "https://srv-ccmanager.phibo.com:27015/Fases/PhiboGrids/Zirconio/ZrFaseProd.aspx")!
+    // ---- Taules de "Fase Mecanizado" (pestanya Disponibles) ----
     static let machineGrid = "ContentPlaceHolder1_PhgDisponibles"   // PhgPendientes / PhgTodos per a les altres pestanyes
     static let machineNames = ["IMES", "DATRON"]
+    static let trackMachines = true         // Zirconi: peces per IMES / DATRON
+    static let trackProgrammers = true      // Fitxers per programador (columna "Prog")
+    static let machineCenter = "Ourense"
+    static let zirconiKey = "Zr"
+
+    /// Una pàgina de Fase Mecanizado que l'app llegeix sencera (totes les pàgines de la taula).
+    struct Scan {
+        let key: String       // clau interna
+        let short: String     // capçalera de la columna
+        let label: String     // text de progrés
+        let center: String
+        let material: String  // coincideix amb el nom del material del menú
+        let url: URL
+    }
+    private static let base = "https://srv-ccmanager.phibo.com:27015/Fases/PhiboGrids/"
+    static let scans: [Scan] = [
+        Scan(key: "TiES", short: "Ti ES", label: "Titanio España", center: "España", material: "Titanio", url: URL(string: base + "Titanio/Produccion.aspx")!),
+        Scan(key: "TiOU", short: "Ti OU", label: "Titanio Ourense", center: "Ourense", material: "Titanio", url: URL(string: base + "Titanio/Produccion.aspx")!),
+        Scan(key: "Zr", short: "Zr", label: "Zirconio Ourense", center: "Ourense", material: "Zirconio", url: URL(string: base + "Zirconio/ZrFaseProd.aspx")!),
+        Scan(key: "PMMA", short: "PMMA", label: "PMMA Ourense", center: "Ourense", material: "PMMA", url: URL(string: base + "PMMA/PMMAFaseMec.aspx")!),
+    ]
 
     struct Center { let name: String; let materials: [String] }
     static let centers = [
