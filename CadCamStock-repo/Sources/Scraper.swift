@@ -70,6 +70,7 @@ final class Scraper: NSObject, ObservableObject {
     @Published var needsManualLogin = false   // mostra la web perquè facis login tu
 
     let webView: WKWebView
+    private var activeGrid = ""          // taula que s'està llegint ara (varia segons la pàgina)
 
     override init() {
         let cfg = WKWebViewConfiguration()
@@ -259,6 +260,7 @@ final class Scraper: NSObject, ObservableObject {
                     try await switchCenter(to: scan.center)
                     currentC = scan.center
                 }
+                activeGrid = scan.grid
                 let r = try await scanGrid(scan.url, expectRows: (expectedFiles(scan) ?? 1) > 0)
                 rowsByKey[scan.key] = r.rows
                 if scan.key == Config.zirconiKey {
@@ -353,12 +355,18 @@ final class Scraper: NSObject, ObservableObject {
     private func waitForGrid(expectRows: Bool) async throws -> GridPage {
         let patience = expectRows ? 130 : 20          // ~20 s si el menú diu que hi ha fitxers, ~3 s si no
         var nogrid = 0
+        var clicks = 0
         for _ in 0..<200 {                                           // ~30 s
             try await Task.sleep(nanoseconds: 150_000_000)
             let st = (try? await js(gridStateJS)) as? String ?? "wait"
             if st == "grid", let p = await readGridPage(), p.found, !p.rows.isEmpty { return p }
             if st == "nogrid" {
                 nogrid += 1
+                // Pot ser que la pestanya activa no sigui "Disponibles": la toquem com faries tu.
+                if expectRows && nogrid == 8 && clicks < 2 {
+                    let r = (try? await js(clickTabJS)) as? String
+                    if r == "ok" { clicks += 1; nogrid = 0 }
+                }
                 if nogrid > patience { return GridPage(found: false, sig: "", rows: [], hasPiezas: false, debug: "") }   // taula buida o no trobada
             } else { nogrid = 0 }
         }
@@ -388,14 +396,14 @@ final class Scraper: NSObject, ObservableObject {
 
     /// Nom del control tal com surt als enllaços de pàgina: ContentPlaceHolder1$PhgDisponibles$GvwGrid
     private var gridPostbackName: String {
-        Config.machineGrid.replacingOccurrences(of: "_", with: "$") + "$GvwGrid"
+        activeGrid.replacingOccurrences(of: "_", with: "$") + "$GvwGrid"
     }
 
     private var gridStateJS: String { """
     (() => {
       if (window.__stale === 1) return 'wait';
       if (document.readyState !== 'complete') return 'wait';
-      const G = '\(Config.machineGrid)_GvwGrid_';
+      const G = '\(activeGrid)_GvwGrid_';
       const has = [...document.querySelectorAll('[id^="' + G + '"]')].some(e => /_(TipoMaquina|ProgFirma)_[0-9]+$/.test(e.id));
       if (has) return 'grid';
       if (document.getElementById('\(Config.comboId)')) return 'nogrid';
@@ -406,7 +414,7 @@ final class Scraper: NSObject, ObservableObject {
     /// Llegeix NOMÉS les files reals de la taula (ids ..._GvwGrid_TipoMaquina_0, ..._GvwGrid_ProgFirma_0, …).
     private var gridReadJS: String { """
     (() => {
-      const G = '\(Config.machineGrid)_GvwGrid_';
+      const G = '\(activeGrid)_GvwGrid_';
       const rx = new RegExp('^' + G + '(TipoMaquina|ProgFirma)_[0-9]+$');
       const num = t => { const n = parseInt((t || '').replace(/[^0-9]/g, '')); return isNaN(n) ? null : n; };
 
@@ -443,14 +451,35 @@ final class Scraper: NSObject, ObservableObject {
     })()
     """ }
 
+    /// Toca la pestanya (Pendientes / Disponibles / Todos) que toca llegir.
+    private var clickTabJS: String { """
+    (() => {
+      const want = '\(Config.tabName)'.toLowerCase();
+      const cands = [...document.querySelectorAll('a,button,li,span,div,input,label,td')].filter(e => {
+        const t = ((e.tagName === 'INPUT' ? e.value : e.textContent) || '').trim().toLowerCase();
+        return t.length < 30 && (t === want || t.indexOf(want + ' ') === 0 || t.indexOf(want + '(') === 0) && e.children.length <= 2;
+      });
+      if (!cands.length) return 'none';
+      const el = cands.find(e => e.tagName === 'A') || cands[cands.length - 1];
+      el.click();
+      return 'ok';
+    })()
+    """ }
+
     /// Què veu l'app quan no troba la taula (per diagnosticar-ho).
     private var diagJS: String { """
     (() => {
-      const any = [...document.querySelectorAll('[id*="TipoMaquina"],[id*="ProgFirma"]')].map(e => e.id);
-      const grids = [...new Set([...document.querySelectorAll('[id*="_GvwGrid"]')].map(e => e.id.split('_GvwGrid')[0]))];
-      return 'pàgina ' + location.pathname.split('/').slice(-2).join('/') + ' · títol «' + (document.title || '').slice(0, 30) +
-             '» · taules: ' + (grids.slice(0, 4).join(', ') || 'cap') +
-             ' · ids Prog/Màq: ' + (any.slice(0, 3).join(', ') || 'cap');
+      const counts = {};
+      document.querySelectorAll('[id*="_GvwGrid_"]').forEach(e => {
+        if (/_(TipoMaquina|ProgFirma)_[0-9]+$/.test(e.id)) {
+          const g = e.id.split('_GvwGrid')[0].replace('ContentPlaceHolder1_', '');
+          counts[g] = (counts[g] || 0) + 1;
+        }
+      });
+      const rowInfo = Object.keys(counts).map(k => k + '=' + counts[k]).join(', ') || 'cap fila en cap taula';
+      const grids = [...new Set([...document.querySelectorAll('[id*="_GvwGrid"]')].map(e => e.id.split('_GvwGrid')[0].replace('ContentPlaceHolder1_', '')))];
+      return 'pàgina ' + location.pathname.split('/').slice(-2).join('/') + ' · llegeixo «\(activeGrid)» · taules: ' +
+             (grids.slice(0, 6).join(', ') || 'cap') + ' · files per taula: ' + rowInfo;
     })()
     """ }
 
