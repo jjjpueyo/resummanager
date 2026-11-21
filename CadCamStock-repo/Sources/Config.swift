@@ -14,7 +14,7 @@ enum Config {
     static let menuPrefix = "cpl_menu_sup_derecha_menuFases_"
 
     // ---- Taules de "Fase Mecanizado" (pestanya Disponibles) ----
-    static let machineGrid = "ContentPlaceHolder1_PhgDisponibles"   // PhgPendientes / PhgTodos per a les altres pestanyes
+    static let tabName = "Disponibles"      // pestanya que es llegeix (Pendientes / Disponibles / Todos)
     static let machineNames = ["IMES", "DATRON"]
     static let trackMachines = true         // Zirconi: peces per IMES / DATRON
     static let trackProgrammers = true      // Fitxers per programador (columna "Prog")
@@ -24,6 +24,7 @@ enum Config {
     /// Una pàgina de Fase Mecanizado que l'app llegeix sencera (totes les pàgines de la taula).
     struct Scan {
         let key: String       // clau interna
+        let grid: String      // nom de la taula de la pestanya "Disponibles" en aquesta pàgina
         let short: String     // capçalera de la columna
         let label: String     // text de progrés
         let center: String
@@ -32,10 +33,10 @@ enum Config {
     }
     private static let base = "https://srv-ccmanager.phibo.com:27015/Fases/PhiboGrids/"
     static let scans: [Scan] = [
-        Scan(key: "TiES", short: "Ti ES", label: "Titanio España", center: "España", material: "Titanio", url: URL(string: base + "Titanio/Produccion.aspx")!),
-        Scan(key: "TiOU", short: "Ti OU", label: "Titanio Ourense", center: "Ourense", material: "Titanio", url: URL(string: base + "Titanio/Produccion.aspx")!),
-        Scan(key: "Zr", short: "Zr", label: "Zirconio Ourense", center: "Ourense", material: "Zirconio", url: URL(string: base + "Zirconio/ZrFaseProd.aspx")!),
-        Scan(key: "PMMA", short: "PMMA", label: "PMMA Ourense", center: "Ourense", material: "PMMA", url: URL(string: base + "PMMA/PMMAFaseMec.aspx")!),
+        Scan(key: "TiES", grid: "ContentPlaceHolder1_PhgCFDisponibles", short: "Ti ES", label: "Titanio España", center: "España", material: "Titanio", url: URL(string: base + "Titanio/Produccion.aspx")!),
+        Scan(key: "TiOU", grid: "ContentPlaceHolder1_PhgCFDisponibles", short: "Ti OU", label: "Titanio Ourense", center: "Ourense", material: "Titanio", url: URL(string: base + "Titanio/Produccion.aspx")!),
+        Scan(key: "Zr", grid: "ContentPlaceHolder1_PhgDisponibles", short: "Zr", label: "Zirconio Ourense", center: "Ourense", material: "Zirconio", url: URL(string: base + "Zirconio/ZrFaseProd.aspx")!),
+        Scan(key: "PMMA", grid: "ContentPlaceHolder1_PhgCFDisponibles", short: "PMMA", label: "PMMA Ourense", center: "Ourense", material: "PMMA", url: URL(string: base + "PMMA/PMMAFaseMec.aspx")!),
     ]
 
     struct Center { let name: String; let materials: [String] }
