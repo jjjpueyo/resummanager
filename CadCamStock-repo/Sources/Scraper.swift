@@ -251,16 +251,25 @@ final class Scraper: NSObject, ObservableObject {
         var rowsByKey: [String: [GridRow]] = [:]
         var notes: [String] = []
         var zrPages: [Int] = []
+        var onMain = true            // en començar som a la pàgina d'entrada
 
         for scan in ordered {
             status = "Llegint \(scan.label)…"
             do {
                 if scan.center != currentC {
-                    try await goToMainPage()            // el selector de centre és a la pàgina d'entrada
+                    if !onMain { try await goToMainPage() }     // el selector de centre és a la pàgina d'entrada
                     try await switchCenter(to: scan.center)
                     currentC = scan.center
+                    onMain = true
+                } else if !onMain {
+                    // Entre una taula i la següent passem per la pàgina d'entrada: si anem d'una pàgina de
+                    // Fase Mecanizado directament a una altra, la web sembla arrossegar l'estat de l'anterior
+                    // i la nova surt sense files.
+                    try await goToMainPage()
+                    onMain = true
                 }
                 activeGrid = scan.grid
+                onMain = false
                 let r = try await scanGrid(scan.url, expectRows: (expectedFiles(scan) ?? 1) > 0)
                 rowsByKey[scan.key] = r.rows
                 if scan.key == Config.zirconiKey {
@@ -469,17 +478,17 @@ final class Scraper: NSObject, ObservableObject {
     /// Què veu l'app quan no troba la taula (per diagnosticar-ho).
     private var diagJS: String { """
     (() => {
-      const counts = {};
-      document.querySelectorAll('[id*="_GvwGrid_"]').forEach(e => {
-        if (/_(TipoMaquina|ProgFirma)_[0-9]+$/.test(e.id)) {
-          const g = e.id.split('_GvwGrid')[0].replace('ContentPlaceHolder1_', '');
-          counts[g] = (counts[g] || 0) + 1;
-        }
+      const P = 'ContentPlaceHolder1_';
+      const grids = [...new Set([...document.querySelectorAll('[id*="_GvwGrid"]')].map(e => e.id.split('_GvwGrid')[0].replace(P, '')))];
+      const info = grids.slice(0, 4).map(g => {
+        const full = P + g;
+        const t = document.getElementById(full + '_GvwGrid');
+        const ids = [...document.querySelectorAll('[id^="' + full + '_GvwGrid_"]')]
+          .map(e => e.id.replace(full + '_GvwGrid_', '')).filter(x => /_[0-9]+$/.test(x)).slice(0, 3);
+        const txt = t ? (t.textContent || '').replace(/\\s+/g, ' ').trim().slice(0, 40) : '';
+        return g.replace('Phg', '') + '[tr=' + (t ? t.rows.length : '—') + ' ids=' + (ids.join(',') || 'cap') + ' «' + txt + '»]';
       });
-      const rowInfo = Object.keys(counts).map(k => k + '=' + counts[k]).join(', ') || 'cap fila en cap taula';
-      const grids = [...new Set([...document.querySelectorAll('[id*="_GvwGrid"]')].map(e => e.id.split('_GvwGrid')[0].replace('ContentPlaceHolder1_', '')))];
-      return 'pàgina ' + location.pathname.split('/').slice(-2).join('/') + ' · llegeixo «\(activeGrid)» · taules: ' +
-             (grids.slice(0, 6).join(', ') || 'cap') + ' · files per taula: ' + rowInfo;
+      return 'pàgina ' + location.pathname.split('/').slice(-2).join('/') + ' · llegeixo ' + '\(activeGrid)'.replace(P, '') + ' · ' + info.join(' ');
     })()
     """ }
 
