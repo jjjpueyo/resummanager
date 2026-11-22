@@ -44,6 +44,8 @@ private struct ScanResult {
     var pageCounts: [Int]
     var hasPiezas: Bool
     var debug: String
+    var expected: Int?        // fitxers que diu el menú per a aquest material
+    var mainCount: Int        // files de la pestanya principal (Disponibles): és la que ha de quadrar amb el menú
 }
 private struct Cache: Codable {
     var date: Date
@@ -70,6 +72,7 @@ final class Scraper: NSObject, ObservableObject {
     @Published var needsManualLogin = false   // mostra la web perquè facis login tu
 
     let webView: WKWebView
+    private var got: [String: CenterResult] = [:]   // números per centre, llegits dels menús
     private var activeGrid = ""          // taula que s'està llegint ara (varia segons la pàgina)
 
     override init() {
@@ -101,34 +104,29 @@ final class Scraper: NSObject, ObservableObject {
             webView.load(URLRequest(url: Config.cadcamURL))
             try await ensureLoggedIn()
 
-            // Comencem pel centre on ja som (cap recàrrega extra) i després l'altre.
-            let here = await currentCenter()
-            let ordered = Config.centers.filter { $0.name == here } + Config.centers.filter { $0.name != here }
-
-            var got: [String: CenterResult] = [:]
-            for c in ordered {
-                status = "Llegint \(c.name)…"
-                try await switchCenter(to: c.name)
-                let raw = try await readCounts()
-                let mats = c.materials.map {
-                    MaterialCount(id: $0, prog: raw["\($0)Prog"] ?? nil, mec: raw["\($0)Prod"] ?? nil)
-                }
-                // Si cap enllaç no existeix, la pàgina no s'ha carregat bé: error, no zeros falsos.
-                if mats.allSatisfy({ $0.prog == nil && $0.mec == nil }) {
-                    throw ScrapeError(message: "No s'han pogut llegir dades de \(c.name)")
-                }
-                got[c.name] = CenterResult(id: c.name, materials: mats)
+            got = [:]
+            status = "Llegint dades…"
+            let here = await currentCenter() ?? ""
+            // Els números del centre actual surten de la pàgina d'entrada: es veuen al moment.
+            guard await captureCounts() != nil else {
+                throw ScrapeError(message: "No s'han pogut llegir dades de \(here)")
             }
-            let out = Config.centers.compactMap { got[$0.name] }
-            results = out
             lastUpdate = Date()
             saveCache()
             status = ""
 
-            // Taules de Fase Mecanitzat: màquines de Zirconi + programadors (en segon pla, els números de dalt ja es veuen)
             if Config.trackMachines || Config.trackProgrammers {
-                await scanAll()
+                // Taules de Fase Mecanitzat: també ens donen els números de l'altre centre (el menú hi és a totes les pàgines).
+                await scanAll(here: here)
+            } else {
+                for c in Config.centers where c.name != here {
+                    try await switchCenter(to: c.name)
+                    _ = await captureCounts()
+                }
             }
+            lastUpdate = Date()
+            saveCache()
+            status = ""
         } catch {
             status = error.localizedDescription
         }
@@ -238,58 +236,69 @@ final class Scraper: NSObject, ObservableObject {
         UserDefaults.standard.set(enc, forKey: "cache")
     }
 
-    private func expectedFiles(_ scan: Config.Scan) -> Int? {
-        results.first { $0.id == scan.center }?.materials.first { $0.id == scan.material }?.mec
+    /// Llegeix els números del menú de la pàgina actual i els guarda per al centre que mostra el selector.
+    private func captureCounts() async -> [String: Int?]? {
+        guard let center = await currentCenter(),
+              let c = Config.centers.first(where: { $0.name == center }),
+              let raw = try? await readCounts() else { return nil }
+        let mats = c.materials.map {
+            MaterialCount(id: $0, prog: raw["\($0)Prog"] ?? nil, mec: raw["\($0)Prod"] ?? nil)
+        }
+        // Si cap enllaç no existeix, la pàgina no s'ha carregat bé: res (millor que uns zeros falsos).
+        if mats.allSatisfy({ $0.prog == nil && $0.mec == nil }) { return nil }
+        got[center] = CenterResult(id: center, materials: mats)
+        publishPartial()
+        return raw
     }
 
-    private func scanAll() async {
+    private func publishPartial() {
+        var out: [CenterResult] = []
+        for c in Config.centers {
+            if let r = got[c.name] { out.append(r) }
+            else if let old = results.first(where: { $0.id == c.name }) { out.append(old) }
+        }
+        results = out
+    }
+
+    private func scanAll(here: String) async {
         machinesNote = ""
         programmersNote = ""
-        let here = await currentCenter()
-        var currentC = here ?? ""
-        let ordered = Config.scans.filter { $0.center == here } + Config.scans.filter { $0.center != here }
         var rowsByKey: [String: [GridRow]] = [:]
         var notes: [String] = []
         var zrPages: [Int] = []
-        var onMain = true            // en començar som a la pàgina d'entrada
 
-        for scan in ordered {
-            status = "Llegint \(scan.label)…"
+        // Ordre pensat per estalviar recàrregues: Titanio és a les dues bandes, així que després de llegir-lo
+        // en un centre canviem de centre SOBRE LA MATEIXA PÀGINA (true = carregar pàgina, false = ja hi som).
+        let plan: [(String, Bool)] = (here == "España")
+            ? [("TiES", true), ("TiOU", false), ("Zr", true), ("PMMA", true)]
+            : [("Zr", true), ("PMMA", true), ("TiOU", true), ("TiES", false)]
+
+        for (key, load) in plan {
+            guard let sc = Config.scans.first(where: { $0.key == key }) else { continue }
+            status = "Llegint \(sc.label)…"
             do {
-                if scan.center != currentC {
-                    if !onMain { try await goToMainPage() }     // el selector de centre és a la pàgina d'entrada
-                    try await switchCenter(to: scan.center)
-                    currentC = scan.center
-                    onMain = true
-                } else if !onMain {
-                    // Entre una taula i la següent passem per la pàgina d'entrada: si anem d'una pàgina de
-                    // Fase Mecanizado directament a una altra, la web sembla arrossegar l'estat de l'anterior
-                    // i la nova surt sense files.
-                    try await goToMainPage()
-                    onMain = true
-                }
-                activeGrid = scan.grid
-                onMain = false
-                let r = try await scanGrid(scan.url, expectRows: (expectedFiles(scan) ?? 1) > 0)
-                rowsByKey[scan.key] = r.rows
-                if scan.key == Config.zirconiKey {
+                if !load { try await switchCenter(to: sc.center) }
+                activeGrid = sc.grid
+                let r = try await scanGrid(sc, load: load)
+                rowsByKey[sc.key] = r.rows
+                if sc.key == Config.zirconiKey {
                     zrPages = r.pageCounts
-                    if r.rows.isEmpty && !r.debug.isEmpty {
+                    if r.mainCount == 0 && !r.debug.isEmpty {
                         machinesNote = "No trobo la taula de Zirconi. [" + r.debug + "]"
                     }
                     if !r.hasPiezas && !r.rows.isEmpty {
                         machinesNote = "No trobo la columna «Nº Piezas». " + String(r.debug.prefix(300))
                     }
                 }
-                if let e = expectedFiles(scan), e != r.rows.count {
-                    var m = "\(scan.label): he llegit \(r.rows.count) fitxers i el menú en diu \(e)."
+                if let e = r.expected, e != r.mainCount {
+                    var m = "\(sc.label): he llegit \(r.mainCount) fitxers i el menú en diu \(e)."
                     if !r.pageCounts.isEmpty { m += " Per pàgines: " + r.pageCounts.map(String.init).joined(separator: " + ") }
-                    if r.rows.isEmpty && !r.debug.isEmpty { m += " [" + r.debug + "]" }
+                    if r.mainCount == 0 && !r.debug.isEmpty { m += " [" + r.debug + "]" }
                     notes.append(m)
                 }
             } catch {
-                notes.append("\(scan.label): \(error.localizedDescription)")
-                if scan.key == Config.zirconiKey { machinesNote = error.localizedDescription }
+                notes.append("\(sc.label): \(error.localizedDescription)")
+                if sc.key == Config.zirconiKey { machinesNote = error.localizedDescription }
             }
         }
 
@@ -322,59 +331,94 @@ final class Scraper: NSObject, ObservableObject {
 
         programmersNote = notes.joined(separator: "\n")
         saveCache()
-        status = ""
     }
 
-    private func goToMainPage() async throws {
-        _ = try? await js("window.__stale = 1")
-        webView.load(URLRequest(url: Config.cadcamURL))
-        for _ in 0..<200 {
-            try await Task.sleep(nanoseconds: 150_000_000)
+    /// Espera que la pàgina hagi carregat (el selector de centre ja hi és).
+    private func waitApp() async throws {
+        for _ in 0..<300 {                                           // ~30 s
+            try await Task.sleep(nanoseconds: 100_000_000)
             let st = (try? await js(Self.stateJS)) as? String
             if st == "app" { return }
         }
-        throw ScrapeError(message: "No he pogut tornar a la pàgina principal")
+        throw ScrapeError(message: "La pàgina no ha carregat")
     }
 
-    /// Carrega una pàgina de Fase Mecanizado i en llegeix totes les pàgines de la taula (de 20 en 20).
-    private func scanGrid(_ url: URL, expectRows: Bool) async throws -> ScanResult {
-        _ = try? await js("window.__stale = 1")
-        webView.load(URLRequest(url: url))
-        var page = try await waitForGrid(expectRows: expectRows)
-        if !page.found {
-            let dbg = (try? await js(diagJS)) as? String ?? ""
-            return ScanResult(rows: [], pageCounts: [], hasPiezas: false, debug: dbg)
+    /// Llegeix una taula de Fase Mecanizado (totes les pàgines de 20 en 20). Si load és false, la pàgina ja és carregada.
+    private func scanGrid(_ sc: Config.Scan, load: Bool) async throws -> ScanResult {
+        if load {
+            _ = try? await js("window.__stale = 1")
+            webView.load(URLRequest(url: sc.url))
         }
+        try await waitApp()
+        // Els números del menú d'aquesta pàgina (frescos) ens diuen quants fitxers hi ha d'haver.
+        let raw = await captureCounts()
+        let expected: Int? = raw?["\(sc.material)Prod"] ?? nil
 
-        let first = page
-        var all = page.rows
-        var counts = [page.rows.count]
-        var n = 2
-        while n <= 80 {
-            let r = (try? await js(clickPageJS(n))) as? String
-            if r != "ok" { break }                                   // no hi ha pàgina n: hem acabat
-            page = try await waitForNewPage(after: page.sig)
-            all += page.rows
-            counts.append(page.rows.count)
-            n += 1
+        // Pestanya principal (Disponibles): és la que ha de quadrar amb el menú.
+        var all: [GridRow] = []
+        var counts: [Int] = []
+        var hasPiezas = false
+        var debug = ""
+        var page = try await waitForGrid(expectRows: (expected ?? 1) > 0, tab: Config.tabName)
+        if page.found {
+            hasPiezas = page.hasPiezas
+            debug = page.debug
+            all = page.rows
+            counts = [page.rows.count]
+            var n = 2
+            while n <= 80 {
+                let r = (try? await js(clickPageJS(n))) as? String
+                if r != "ok" { break }                               // no hi ha pàgina n: hem acabat
+                page = try await waitForNewPage(after: page.sig, tab: Config.tabName)
+                all += page.rows
+                counts.append(page.rows.count)
+                n += 1
+            }
+        } else {
+            debug = (try? await js(diagJS)) as? String ?? ""
         }
-        return ScanResult(rows: all, pageCounts: counts, hasPiezas: first.hasPiezas, debug: first.debug)
+        let mainCount = all.count
+
+        // Pestanyes addicionals (Pendientes a Titanio): només per comptar programadors.
+        for tab in sc.extraTabs {
+            activeGrid = tab.grid
+            guard let p0 = try? await waitForGrid(expectRows: false, tab: tab.name, quick: true), p0.found else { continue }
+            var pg = p0
+            all += pg.rows
+            var k = 2
+            while k <= 80 {
+                let r = (try? await js(clickPageJS(k))) as? String
+                if r != "ok" { break }
+                pg = try await waitForNewPage(after: pg.sig, tab: tab.name)
+                all += pg.rows
+                k += 1
+            }
+        }
+        activeGrid = sc.grid
+        return ScanResult(rows: all, pageCounts: counts, hasPiezas: hasPiezas, debug: debug,
+                          expected: expected, mainCount: mainCount)
     }
 
-    private func waitForGrid(expectRows: Bool) async throws -> GridPage {
-        let patience = expectRows ? 130 : 20          // ~20 s si el menú diu que hi ha fitxers, ~3 s si no
+    private func waitForGrid(expectRows: Bool, tab: String, quick: Bool = false) async throws -> GridPage {
+        let patience = quick ? 70 : (expectRows ? 200 : 30)   // ~20 s si el menú diu que hi ha fitxers; ~7 s en una pestanya extra; ~3 s si no n'hi ha
         var nogrid = 0
-        var clicks = 0
-        for _ in 0..<200 {                                           // ~30 s
-            try await Task.sleep(nanoseconds: 150_000_000)
+        var attempt = 0
+        var sinceClick = 0
+        for _ in 0..<300 {                                           // ~30 s
+            try await Task.sleep(nanoseconds: 100_000_000)
             let st = (try? await js(gridStateJS)) as? String ?? "wait"
             if st == "grid", let p = await readGridPage(), p.found, !p.rows.isEmpty { return p }
             if st == "nogrid" {
                 nogrid += 1
-                // Pot ser que la pestanya activa no sigui "Disponibles": la toquem com faries tu.
-                if expectRows && nogrid == 8 && clicks < 2 {
-                    let r = (try? await js(clickTabJS)) as? String
-                    if r == "ok" { clicks += 1; nogrid = 0 }
+                sinceClick += 1
+                // Les files no surten fins que es toca la pestanya "Disponibles": ho fem com tu, provant les dues maneres.
+                if (expectRows || quick) && attempt < 4 && (nogrid == 3 || sinceClick >= 25) {
+                    while attempt < 4 {
+                        let r = (try? await js(clickTabJS(attempt, tab: tab))) as? String ?? "none"
+                        attempt += 1
+                        if r == "ok" { break }
+                    }
+                    sinceClick = 0
                 }
                 if nogrid > patience { return GridPage(found: false, sig: "", rows: [], hasPiezas: false, debug: "") }   // taula buida o no trobada
             } else { nogrid = 0 }
@@ -382,10 +426,22 @@ final class Scraper: NSObject, ObservableObject {
         throw ScrapeError(message: "No he pogut llegir la taula")
     }
 
-    private func waitForNewPage(after sig: String) async throws -> GridPage {
-        for _ in 0..<150 {                                           // ~22 s
-            try await Task.sleep(nanoseconds: 150_000_000)
-            if let p = await readGridPage(), p.found, !p.rows.isEmpty, p.sig != sig { return p }
+    private func waitForNewPage(after sig: String, tab: String) async throws -> GridPage {
+        var lost = 0
+        var reclicked = false
+        for _ in 0..<250 {                                           // ~25 s
+            try await Task.sleep(nanoseconds: 100_000_000)
+            if let p = await readGridPage(), p.found, !p.rows.isEmpty {
+                if p.sig != sig { return p }
+                lost = 0
+            } else {
+                lost += 1
+                // Si en canviar de pàgina la web torna a una altra pestanya, tornem a tocar "Disponibles".
+                if lost == 15 && !reclicked {
+                    reclicked = true
+                    _ = try? await js(clickTabJS(0, tab: tab))
+                }
+            }
         }
         throw ScrapeError(message: "No he pogut canviar de pàgina a la taula")
     }
@@ -460,20 +516,34 @@ final class Scraper: NSObject, ObservableObject {
     })()
     """ }
 
-    /// Toca la pestanya (Pendientes / Disponibles / Todos) que toca llegir.
-    private var clickTabJS: String { """
-    (() => {
-      const want = '\(Config.tabName)'.toLowerCase();
-      const cands = [...document.querySelectorAll('a,button,li,span,div,input,label,td')].filter(e => {
-        const t = ((e.tagName === 'INPUT' ? e.value : e.textContent) || '').trim().toLowerCase();
-        return t.length < 30 && (t === want || t.indexOf(want + ' ') === 0 || t.indexOf(want + '(') === 0) && e.children.length <= 2;
-      });
-      if (!cands.length) return 'none';
-      const el = cands.find(e => e.tagName === 'A') || cands[cands.length - 1];
-      el.click();
-      return 'ok';
-    })()
-    """ }
+    /// Toca una pestanya (Disponibles / Pendientes…). Primer pels ids, després pel text.
+    private func clickTabJS(_ attempt: Int, tab: String) -> String {
+        let ids = tab == Config.tabName
+            ? ["ContentPlaceHolder1_tabDisponibles", "ContentPlaceHolder1_tab"]
+            : ["ContentPlaceHolder1_tab" + tab]
+        return """
+        (() => {
+          const fire = el => ['mousedown', 'mouseup', 'click'].forEach(t =>
+            el.dispatchEvent(new MouseEvent(t, {bubbles: true, cancelable: true, view: window})));
+          const ids = \(q(ids));
+          const n = \(attempt);
+          if (n < ids.length) {
+            const el = document.getElementById(ids[n]);
+            if (el) { fire(el); return 'ok'; }
+            return 'none';
+          }
+          const want = '\(tab)'.toLowerCase();
+          const cands = [...document.querySelectorAll('a,button,li,span,div,input,label,td')].filter(e => {
+            const t = ((e.tagName === 'INPUT' ? e.value : e.textContent) || '').trim().toLowerCase();
+            return t.length < 30 && (t === want || t.indexOf(want + ' ') === 0 || t.indexOf(want + '(') === 0) && e.children.length <= 2;
+          });
+          if (!cands.length) return 'none';
+          const el = n === ids.length ? (cands.find(e => e.tagName === 'A') || cands[cands.length - 1]) : cands[0];
+          fire(el);
+          return 'ok';
+        })()
+        """
+    }
 
     /// Què veu l'app quan no troba la taula (per diagnosticar-ho).
     private var diagJS: String { """
