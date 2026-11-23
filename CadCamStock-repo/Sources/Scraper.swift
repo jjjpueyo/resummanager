@@ -46,6 +46,7 @@ private struct ScanResult {
     var debug: String
     var expected: Int?        // fitxers que diu el menú per a aquest material
     var mainCount: Int        // files de la pestanya principal (Disponibles): és la que ha de quadrar amb el menú
+    var pageNote: String      // si no s'ha pogut passar de pàgina, per què
 }
 private struct Cache: Codable {
     var date: Date
@@ -290,6 +291,7 @@ final class Scraper: NSObject, ObservableObject {
                         machinesNote = "No trobo la columna «Nº Piezas». " + String(r.debug.prefix(300))
                     }
                 }
+                if !r.pageNote.isEmpty { notes.append("\(sc.label): " + r.pageNote) }
                 if let e = r.expected, e != r.mainCount {
                     var m = "\(sc.label): he llegit \(r.mainCount) fitxers i el menú en diu \(e)."
                     if !r.pageCounts.isEmpty { m += " Per pàgines: " + r.pageCounts.map(String.init).joined(separator: " + ") }
@@ -354,49 +356,85 @@ final class Scraper: NSObject, ObservableObject {
         let raw = await captureCounts()
         let expected: Int? = raw?["\(sc.material)Prod"] ?? nil
 
-        // Pestanya principal (Disponibles): és la que ha de quadrar amb el menú.
         var all: [GridRow] = []
         var counts: [Int] = []
         var hasPiezas = false
         var debug = ""
-        var page = try await waitForGrid(expectRows: (expected ?? 1) > 0, tab: Config.tabName)
+        var notes: [String] = []
+
+        // Pestanya principal (Disponibles): és la que ha de quadrar amb el menú.
+        let page = try await waitForGrid(expectRows: (expected ?? 1) > 0, tab: Config.tabName)
         if page.found {
             hasPiezas = page.hasPiezas
             debug = page.debug
             all = page.rows
             counts = [page.rows.count]
-            var n = 2
-            while n <= 80 {
-                let r = (try? await js(clickPageJS(n))) as? String
-                if r != "ok" { break }                               // no hi ha pàgina n: hem acabat
-                page = try await waitForNewPage(after: page.sig, tab: Config.tabName)
-                all += page.rows
-                counts.append(page.rows.count)
-                n += 1
-            }
+            let rest = await readRemainingPages(from: page, tab: Config.tabName)
+            all += rest.rows
+            counts += rest.counts
+            if !rest.note.isEmpty { notes.append(rest.note) }
         } else {
             debug = (try? await js(diagJS)) as? String ?? ""
         }
         let mainCount = all.count
 
-        // Pestanyes addicionals (Pendientes a Titanio): només per comptar programadors.
+        // Pestanyes addicionals (Pendientes): per comptar programadors i màquines.
         for tab in sc.extraTabs {
             activeGrid = tab.grid
             guard let p0 = try? await waitForGrid(expectRows: false, tab: tab.name, quick: true), p0.found else { continue }
-            var pg = p0
-            all += pg.rows
-            var k = 2
-            while k <= 80 {
-                let r = (try? await js(clickPageJS(k))) as? String
-                if r != "ok" { break }
-                pg = try await waitForNewPage(after: pg.sig, tab: tab.name)
-                all += pg.rows
-                k += 1
-            }
+            all += p0.rows
+            let rest = await readRemainingPages(from: p0, tab: tab.name)
+            all += rest.rows
+            if !rest.note.isEmpty { notes.append(rest.note) }
         }
         activeGrid = sc.grid
         return ScanResult(rows: all, pageCounts: counts, hasPiezas: hasPiezas, debug: debug,
-                          expected: expected, mainCount: mainCount)
+                          expected: expected, mainCount: mainCount, pageNote: notes.joined(separator: " "))
+    }
+
+    /// Passa a la pàgina 2, 3… de la taula actual fins que no n'hi ha més. Si una pàgina no es pot carregar,
+    /// no perdem el que ja hem llegit: tornem les files i una nota.
+    private func readRemainingPages(from first: GridPage, tab: String) async -> (rows: [GridRow], counts: [Int], note: String) {
+        var rows: [GridRow] = []
+        var counts: [Int] = []
+        var page = first
+        var n = 2
+        while n <= 80 {
+            let target = (try? await js(pageInfoJS(n))) as? String ?? ""
+            if target.isEmpty { break }                               // no hi ha pàgina n: hem acabat
+            guard let next = await changePage(to: n, target: target, from: page.sig, tab: tab) else {
+                let d = (try? await js(pagerDiagJS)) as? String ?? ""
+                return (rows, counts, "\(tab): no he pogut passar a la pàgina \(n) [\(d)]")
+            }
+            page = next
+            rows += next.rows
+            counts.append(next.rows.count)
+            n += 1
+        }
+        return (rows, counts, "")
+    }
+
+    private func waitChange(_ sig: String, polls: Int) async -> GridPage? {
+        for _ in 0..<polls {
+            _ = try? await Task.sleep(nanoseconds: 100_000_000)
+            if let p = await readGridPage(), p.found, !p.rows.isEmpty, p.sig != sig { return p }
+        }
+        return nil
+    }
+
+    /// Canvia de pàgina de tres maneres, de més simple a més insistent.
+    private func changePage(to n: Int, target: String, from sig: String, tab: String) async -> GridPage? {
+        // 1) clic a l'enllaç de la pàgina
+        _ = try? await js(clickPageJS(n))
+        if let p = await waitChange(sig, polls: 80) { return p }
+        // 2) crida directa al postback d'ASP.NET
+        _ = try? await js(postbackPageJS(n, target: target))
+        if let p = await waitChange(sig, polls: 80) { return p }
+        // 3) tornem a tocar la pestanya i repetim el clic
+        _ = try? await js(clickTabJS(0, tab: tab))
+        _ = try? await Task.sleep(nanoseconds: 2_000_000_000)
+        _ = try? await js(clickPageJS(n))
+        return await waitChange(sig, polls: 100)
     }
 
     private func waitForGrid(expectRows: Bool, tab: String, quick: Bool = false) async throws -> GridPage {
@@ -424,26 +462,6 @@ final class Scraper: NSObject, ObservableObject {
             } else { nogrid = 0 }
         }
         throw ScrapeError(message: "No he pogut llegir la taula")
-    }
-
-    private func waitForNewPage(after sig: String, tab: String) async throws -> GridPage {
-        var lost = 0
-        var reclicked = false
-        for _ in 0..<250 {                                           // ~25 s
-            try await Task.sleep(nanoseconds: 100_000_000)
-            if let p = await readGridPage(), p.found, !p.rows.isEmpty {
-                if p.sig != sig { return p }
-                lost = 0
-            } else {
-                lost += 1
-                // Si en canviar de pàgina la web torna a una altra pestanya, tornem a tocar "Disponibles".
-                if lost == 15 && !reclicked {
-                    reclicked = true
-                    _ = try? await js(clickTabJS(0, tab: tab))
-                }
-            }
-        }
-        throw ScrapeError(message: "No he pogut canviar de pàgina a la taula")
     }
 
     private func readGridPage() async -> GridPage? {
@@ -559,6 +577,43 @@ final class Scraper: NSObject, ObservableObject {
         return g.replace('Phg', '') + '[tr=' + (t ? t.rows.length : '—') + ' ids=' + (ids.join(',') || 'cap') + ' «' + txt + '»]';
       });
       return 'pàgina ' + location.pathname.split('/').slice(-2).join('/') + ' · llegeixo ' + '\(activeGrid)'.replace(P, '') + ' · ' + info.join(' ');
+    })()
+    """ }
+
+    /// Si existeix l'enllaç a la pàgina n, torna l'objectiu del postback (o 'x'); si no, text buit.
+    private func pageInfoJS(_ n: Int) -> String { """
+    (() => {
+      const H = '\(gridPostbackName)';
+      const a = [...document.querySelectorAll('a')].find(x => {
+        const h = x.getAttribute('href') || '';
+        return h.indexOf(H) > -1 && h.indexOf("Page$\(n)'") > -1;
+      });
+      if (!a) return '';
+      const m = (a.getAttribute('href') || '').match(/__doPostBack\\('([^']*)'/);
+      return m ? m[1] : 'x';
+    })()
+    """ }
+
+    private func postbackPageJS(_ n: Int, target: String) -> String {
+        let t = target == "x" ? "ctl00$" + gridPostbackName : target
+        return """
+        (() => {
+          window.setTimeout(function () { __doPostBack(\(q(t)), 'Page$\(n)'); }, 0);
+          return 'ok';
+        })()
+        """
+    }
+
+    /// Què veu l'app del paginador quan no pot passar de pàgina (per diagnosticar-ho).
+    private var pagerDiagJS: String { """
+    (() => {
+      const H = '\(gridPostbackName)';
+      const links = [...document.querySelectorAll('a')].filter(x => {
+        const h = x.getAttribute('href') || '';
+        return h.indexOf(H) > -1 && h.indexOf('Page$') > -1;
+      }).map(x => (x.textContent || '').trim());
+      const n = document.querySelectorAll('[id^="\(activeGrid)_GvwGrid_"]').length;
+      return 'enllaços de pàgina: ' + (links.slice(0, 8).join(',') || 'cap') + ' · elements de fila: ' + n + ' · ' + document.readyState;
     })()
     """ }
 
