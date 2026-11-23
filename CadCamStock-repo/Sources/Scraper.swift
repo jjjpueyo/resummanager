@@ -107,23 +107,28 @@ final class Scraper: NSObject, ObservableObject {
 
             got = [:]
             status = "Llegint dades…"
-            let here = await currentCenter() ?? ""
-            // Els números del centre actual surten de la pàgina d'entrada: es veuen al moment.
+            // 1) Els números es llegeixen SEMPRE de la pàgina d'entrada (com abans): primer el centre on som...
+            let start = await currentCenter() ?? ""
             guard await captureCounts() != nil else {
-                throw ScrapeError(message: "No s'han pogut llegir dades de \(here)")
+                throw ScrapeError(message: "No s'han pogut llegir dades de \(start)")
+            }
+            // 2) ...i després l'altre, canviant el selector sobre aquesta mateixa pàgina.
+            for c in Config.centers where c.name != start {
+                status = "Llegint \(c.name)…"
+                try await switchCenter(to: c.name)
+                guard await captureCounts() != nil else {
+                    throw ScrapeError(message: "No s'han pogut llegir dades de \(c.name)")
+                }
             }
             lastUpdate = Date()
             saveCache()
             status = ""
 
+            // 3) Només ara: taules de Fase Mecanitzat (màquines de Zirconi + sigles dels programadors).
+            //    Aquestes lectures NO toquen els números de dalt.
             if Config.trackMachines || Config.trackProgrammers {
-                // Taules de Fase Mecanitzat: també ens donen els números de l'altre centre (el menú hi és a totes les pàgines).
-                await scanAll(here: here)
-            } else {
-                for c in Config.centers where c.name != here {
-                    try await switchCenter(to: c.name)
-                    _ = await captureCounts()
-                }
+                let nowCenter = await currentCenter() ?? ""
+                await scanAll(here: nowCenter)
             }
             lastUpdate = Date()
             saveCache()
@@ -252,6 +257,10 @@ final class Scraper: NSObject, ObservableObject {
         return raw
     }
 
+    private func expectedFiles(_ sc: Config.Scan) -> Int? {
+        got[sc.center]?.materials.first { $0.id == sc.material }?.mec
+    }
+
     private func publishPartial() {
         var out: [CenterResult] = []
         for c in Config.centers {
@@ -352,9 +361,8 @@ final class Scraper: NSObject, ObservableObject {
             webView.load(URLRequest(url: sc.url))
         }
         try await waitApp()
-        // Els números del menú d'aquesta pàgina (frescos) ens diuen quants fitxers hi ha d'haver.
-        let raw = await captureCounts()
-        let expected: Int? = raw?["\(sc.material)Prod"] ?? nil
+        // Quants fitxers hi ha d'haver: el número de "Fase Mecanizado" llegit a la pàgina d'entrada.
+        let expected = expectedFiles(sc)
 
         var all: [GridRow] = []
         var counts: [Int] = []
