@@ -39,8 +39,8 @@ enum Config {
     static let scans: [Scan] = [
         Scan(key: "TiES", grid: "ContentPlaceHolder1_PhgCFDisponibles", short: "Ti ES", label: "Titanio España", center: "España", material: "Titanio", url: URL(string: base + "Titanio/Produccion.aspx")!, extraTabs: [Tab(name: "Pendientes", grid: "ContentPlaceHolder1_PhgCFPendientes")]),
         Scan(key: "TiOU", grid: "ContentPlaceHolder1_PhgCFDisponibles", short: "Ti OU", label: "Titanio Ourense", center: "Ourense", material: "Titanio", url: URL(string: base + "Titanio/Produccion.aspx")!, extraTabs: [Tab(name: "Pendientes", grid: "ContentPlaceHolder1_PhgCFPendientes")]),
-        Scan(key: "Zr", grid: "ContentPlaceHolder1_PhgDisponibles", short: "Zr", label: "Zirconio Ourense", center: "Ourense", material: "Zirconio", url: URL(string: base + "Zirconio/ZrFaseProd.aspx")!),
-        Scan(key: "PMMA", grid: "ContentPlaceHolder1_PhgCFDisponibles", short: "PMMA", label: "PMMA Ourense", center: "Ourense", material: "PMMA", url: URL(string: base + "PMMA/PMMAFaseMec.aspx")!),
+        Scan(key: "Zr", grid: "ContentPlaceHolder1_PhgDisponibles", short: "Zr", label: "Zirconio Ourense", center: "Ourense", material: "Zirconio", url: URL(string: base + "Zirconio/ZrFaseProd.aspx")!, extraTabs: [Tab(name: "Pendientes", grid: "ContentPlaceHolder1_PhgPendientes")]),
+        Scan(key: "PMMA", grid: "ContentPlaceHolder1_PhgCFDisponibles", short: "PMMA", label: "PMMA Ourense", center: "Ourense", material: "PMMA", url: URL(string: base + "PMMA/PMMAFaseMec.aspx")!, extraTabs: [Tab(name: "Pendientes", grid: "ContentPlaceHolder1_PhgCFPendientes")]),
     ]
 
     struct Center { let name: String; let materials: [String] }
