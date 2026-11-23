@@ -276,6 +276,7 @@ final class Scraper: NSObject, ObservableObject {
         var rowsByKey: [String: [GridRow]] = [:]
         var notes: [String] = []
         var zrPages: [Int] = []
+        var zrMainRows: [GridRow]? = nil      // Zirconi: només Disponibles (per a les màquines)
 
         // Ordre pensat per estalviar recàrregues: Titanio és a les dues bandes, així que després de llegir-lo
         // en un centre canviem de centre SOBRE LA MATEIXA PÀGINA (true = carregar pàgina, false = ja hi som).
@@ -291,6 +292,7 @@ final class Scraper: NSObject, ObservableObject {
                 activeGrid = sc.grid
                 let r = try await scanGrid(sc, load: load)
                 rowsByKey[sc.key] = r.rows
+                if sc.key == Config.zirconiKey { zrMainRows = Array(r.rows.prefix(r.mainCount)) }
                 if sc.key == Config.zirconiKey {
                     zrPages = r.pageCounts
                     if r.mainCount == 0 && !r.debug.isEmpty {
@@ -314,7 +316,7 @@ final class Scraper: NSObject, ObservableObject {
         }
 
         // Zirconi: peces per màquina
-        if Config.trackMachines, let zr = rowsByKey[Config.zirconiKey] {
+        if Config.trackMachines, let zr = zrMainRows {
             var map: [String: MachineStat] = [:]
             for r in zr {
                 var st = map[r.machine] ?? MachineStat(machine: r.machine, pieces: 0, cases: 0)
@@ -371,7 +373,14 @@ final class Scraper: NSObject, ObservableObject {
         var notes: [String] = []
 
         // Pestanya principal (Disponibles): és la que ha de quadrar amb el menú.
-        let page = try await waitForGrid(expectRows: (expected ?? 1) > 0, tab: Config.tabName)
+        var page = try await waitForGrid(expectRows: (expected ?? 1) > 0, tab: Config.tabName)
+        if !page.found && (expected ?? 0) > 0 {
+            // El menú diu que hi ha fitxers però la taula no ha sortit: tornem a carregar la pàgina i ho reintentem una vegada.
+            _ = try? await js("window.__stale = 1")
+            webView.load(URLRequest(url: sc.url))
+            try await waitApp()
+            page = try await waitForGrid(expectRows: true, tab: Config.tabName)
+        }
         if page.found {
             hasPiezas = page.hasPiezas
             debug = page.debug
@@ -584,7 +593,8 @@ final class Scraper: NSObject, ObservableObject {
         const txt = t ? (t.textContent || '').replace(/\\s+/g, ' ').trim().slice(0, 40) : '';
         return g.replace('Phg', '') + '[tr=' + (t ? t.rows.length : '—') + ' ids=' + (ids.join(',') || 'cap') + ' «' + txt + '»]';
       });
-      return 'pàgina ' + location.pathname.split('/').slice(-2).join('/') + ' · llegeixo ' + '\(activeGrid)'.replace(P, '') + ' · ' + info.join(' ');
+      const tabs = [...document.querySelectorAll('span,a,li,button,div')].filter(e => e.children.length === 0 && /^(pendientes|disponibles|todos)$/i.test((e.textContent || '').trim())).map(e => e.tagName.toLowerCase() + '#' + e.id).slice(0, 6);
+      return 'pàgina ' + location.pathname.split('/').slice(-2).join('/') + ' · llegeixo ' + '\(activeGrid)'.replace(P, '') + ' · ' + info.join(' ') + ' · pestanyes: ' + (tabs.join(', ') || 'cap');
     })()
     """ }
 
