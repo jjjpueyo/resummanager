@@ -39,6 +39,12 @@ private struct GridPage {
     var hasPiezas: Bool
     var debug: String
 }
+private struct TabRead {
+    var page: GridPage?
+    var rows: [GridRow]
+    var counts: [Int]
+    var note: String
+}
 private struct ScanResult {
     var rows: [GridRow]
     var pageCounts: [Int]
@@ -73,6 +79,7 @@ final class Scraper: NSObject, ObservableObject {
     @Published var needsManualLogin = false   // mostra la web perquè facis login tu
 
     let webView: WKWebView
+    private var zrRows: [GridRow]? = nil              // files de Zirconi (Disponibles), llegides a la fase de màquines
     private var got: [String: CenterResult] = [:]   // números per centre, llegits dels menús
     private var activeGrid = ""          // taula que s'està llegint ara (varia segons la pàgina)
 
@@ -124,12 +131,11 @@ final class Scraper: NSObject, ObservableObject {
             saveCache()
             status = ""
 
-            // 3) Només ara: taules de Fase Mecanitzat (màquines de Zirconi + sigles dels programadors).
+            // 3) Després, IMES / DATRON de Zirconi i, per últim (és el que més triga), els programadors.
             //    Aquestes lectures NO toquen els números de dalt.
-            if Config.trackMachines || Config.trackProgrammers {
-                let nowCenter = await currentCenter() ?? ""
-                await scanAll(here: nowCenter)
-            }
+            zrRows = nil
+            if Config.trackMachines { await updateMachines() }
+            if Config.trackProgrammers { await updateProgrammers() }
             lastUpdate = Date()
             saveCache()
             status = ""
@@ -270,38 +276,54 @@ final class Scraper: NSObject, ObservableObject {
         results = out
     }
 
-    private func scanAll(here: String) async {
+    // MARK: - Fase 2: Zirconi per màquina (només la pestanya Disponibles)
+    private func updateMachines() async {
         machinesNote = ""
+        guard let sc = Config.scans.first(where: { $0.key == Config.zirconiKey }) else { return }
+        status = "Llegint màquines de Zirconi…"
+        do {
+            let r = try await readScan(sc)
+            let rows = Array(r.rows.prefix(r.mainCount))
+            zrRows = rows
+            var note = ""
+            if r.mainCount == 0 && !r.debug.isEmpty { note = "No trobo la taula de Zirconi. [" + r.debug + "]" }
+            if !r.hasPiezas && !rows.isEmpty { note = "No trobo la columna «Nº Piezas». " + String(r.debug.prefix(300)) }
+            if !r.pageNote.isEmpty { note += (note.isEmpty ? "" : "\n") + r.pageNote }
+            machinesNote = note
+
+            var map: [String: MachineStat] = [:]
+            for row in rows {
+                var st = map[row.machine] ?? MachineStat(machine: row.machine, pieces: 0, cases: 0)
+                st.pieces += row.pieces
+                st.cases += 1
+                map[row.machine] = st
+            }
+            var out = Config.machineNames.map { map[$0] ?? MachineStat(machine: $0, pieces: 0, cases: 0) }
+            out += map.values.filter { !Config.machineNames.contains($0.machine) }.sorted { $0.machine < $1.machine }
+            machines = MachineSummary(stats: out, date: Date(), pageCounts: r.pageCounts)
+        } catch {
+            machinesNote = error.localizedDescription
+        }
+        saveCache()
+        status = ""
+    }
+
+    // MARK: - Fase 3: programadors (és la que més triga: ha de recórrer tots els materials i centres)
+    private func updateProgrammers() async {
         programmersNote = ""
         var rowsByKey: [String: [GridRow]] = [:]
         var notes: [String] = []
-        var zrPages: [Int] = []
-        var zrMainRows: [GridRow]? = nil      // Zirconi: només Disponibles (per a les màquines)
+        if let z = zrRows { rowsByKey[Config.zirconiKey] = z }       // Zirconi ja llegit a la fase anterior
+        // Primer el que és d'Ourense (ja hi som) i España al final.
+        var keys = ["TiOU", "PMMA", "TiES"]
+        if zrRows == nil { keys.insert(Config.zirconiKey, at: 0) }
 
-        // Ordre pensat per estalviar recàrregues: Titanio és a les dues bandes, així que després de llegir-lo
-        // en un centre canviem de centre SOBRE LA MATEIXA PÀGINA (true = carregar pàgina, false = ja hi som).
-        let plan: [(String, Bool)] = (here == "España")
-            ? [("TiES", true), ("TiOU", false), ("Zr", true), ("PMMA", true)]
-            : [("Zr", true), ("PMMA", true), ("TiOU", true), ("TiES", false)]
-
-        for (key, load) in plan {
+        for key in keys {
             guard let sc = Config.scans.first(where: { $0.key == key }) else { continue }
             status = "Llegint \(sc.label)…"
             do {
-                if !load { try await switchCenter(to: sc.center) }
-                activeGrid = sc.grid
-                let r = try await scanGrid(sc, load: load)
-                rowsByKey[sc.key] = r.rows
-                if sc.key == Config.zirconiKey { zrMainRows = Array(r.rows.prefix(r.mainCount)) }
-                if sc.key == Config.zirconiKey {
-                    zrPages = r.pageCounts
-                    if r.mainCount == 0 && !r.debug.isEmpty {
-                        machinesNote = "No trobo la taula de Zirconi. [" + r.debug + "]"
-                    }
-                    if !r.hasPiezas && !r.rows.isEmpty {
-                        machinesNote = "No trobo la columna «Nº Piezas». " + String(r.debug.prefix(300))
-                    }
-                }
+                let r = try await readScan(sc)
+                rowsByKey[key] = r.rows
                 if !r.pageNote.isEmpty { notes.append("\(sc.label): " + r.pageNote) }
                 if let e = r.expected, e != r.mainCount {
                     var m = "\(sc.label): he llegit \(r.mainCount) fitxers i el menú en diu \(e)."
@@ -311,39 +333,21 @@ final class Scraper: NSObject, ObservableObject {
                 }
             } catch {
                 notes.append("\(sc.label): \(error.localizedDescription)")
-                if sc.key == Config.zirconiKey { machinesNote = error.localizedDescription }
             }
         }
 
-        // Zirconi: peces per màquina
-        if Config.trackMachines, let zr = zrMainRows {
-            var map: [String: MachineStat] = [:]
-            for r in zr {
-                var st = map[r.machine] ?? MachineStat(machine: r.machine, pieces: 0, cases: 0)
-                st.pieces += r.pieces
-                st.cases += 1
-                map[r.machine] = st
+        var byProg: [String: [String: Int]] = [:]
+        for (key, rows) in rowsByKey {
+            for r in rows where !r.prog.isEmpty {
+                byProg[r.prog, default: [:]][key, default: 0] += 1
             }
-            var out = Config.machineNames.map { map[$0] ?? MachineStat(machine: $0, pieces: 0, cases: 0) }
-            out += map.values.filter { !Config.machineNames.contains($0.machine) }.sorted { $0.machine < $1.machine }
-            machines = MachineSummary(stats: out, date: Date(), pageCounts: zrPages)
         }
-
-        // Programadors: fitxers per inicials i per material/centre
-        if Config.trackProgrammers && !rowsByKey.isEmpty {
-            var byProg: [String: [String: Int]] = [:]
-            for (key, rows) in rowsByKey {
-                for r in rows where !r.prog.isEmpty {
-                    byProg[r.prog, default: [:]][key, default: 0] += 1
-                }
-            }
-            let stats = byProg.map { ProgrammerStat(initials: $0.key, counts: $0.value) }
-                .sorted { ($0.total, $1.initials) > ($1.total, $0.initials) }
-            programmers = ProgrammerSummary(stats: stats, date: Date())
-        }
-
+        let stats = byProg.map { ProgrammerStat(initials: $0.key, counts: $0.value) }
+            .sorted { ($0.total, $1.initials) > ($1.total, $0.initials) }
+        if !stats.isEmpty { programmers = ProgrammerSummary(stats: stats, date: Date()) }
         programmersNote = notes.joined(separator: "\n")
         saveCache()
+        status = ""
     }
 
     /// Espera que la pàgina hagi carregat (el selector de centre ja hi és).
@@ -356,79 +360,107 @@ final class Scraper: NSObject, ObservableObject {
         throw ScrapeError(message: "La pàgina no ha carregat")
     }
 
-    /// Llegeix una taula de Fase Mecanizado (totes les pàgines de 20 en 20). Si load és false, la pàgina ja és carregada.
-    private func scanGrid(_ sc: Config.Scan, load: Bool) async throws -> ScanResult {
-        if load {
-            _ = try? await js("window.__stale = 1")
-            webView.load(URLRequest(url: sc.url))
+    /// Posa el selector de centre al centre que toca. La web el torna a España sola en carregar algunes pàgines,
+    /// així que ho comprovem cada vegada abans de llegir res.
+    private func ensureCenter(_ name: String) async throws {
+        for _ in 0..<3 {
+            if await currentCenter() == name { return }
+            try await switchCenter(to: name)
         }
+        if await currentCenter() != name { throw ScrapeError(message: "No he pogut posar el centre \(name)") }
+    }
+
+    /// Carrega la pàgina de Fase Mecanizado d'un material i en llegeix la pestanya Disponibles (totes les pàgines)
+    /// més les pestanyes addicionals que toquin, vigilant sempre que el centre sigui el bo.
+    private func readScan(_ sc: Config.Scan) async throws -> ScanResult {
+        _ = try? await js("window.__stale = 1")
+        webView.load(URLRequest(url: sc.url))
         try await waitApp()
-        // Quants fitxers hi ha d'haver: el número de "Fase Mecanizado" llegit a la pàgina d'entrada.
         let expected = expectedFiles(sc)
+        let expectRows = (expected ?? 1) > 0
 
-        var all: [GridRow] = []
-        var counts: [Int] = []
-        var hasPiezas = false
-        var debug = ""
-        var notes: [String] = []
-
-        // Pestanya principal (Disponibles): és la que ha de quadrar amb el menú.
-        var page = try await waitForGrid(expectRows: (expected ?? 1) > 0, tab: Config.tabName)
-        if !page.found && (expected ?? 0) > 0 {
-            // El menú diu que hi ha fitxers però la taula no ha sortit: tornem a carregar la pàgina i ho reintentem una vegada.
-            _ = try? await js("window.__stale = 1")
-            webView.load(URLRequest(url: sc.url))
+        var main = try await readTab(sc, tab: Config.tabName, grid: sc.grid, expectRows: expectRows, quick: false)
+        if main.page?.found != true && (expected ?? 0) > 0 {
+            // El menú diu que hi ha fitxers però la taula no ha sortit: ho reintentem una vegada navegant
+            // com ho fa una persona (clic a l'enllaç del menú) i, si no hi és, recarregant la URL.
+            let nav = (try? await js(menuClickJS(sc.material))) as? String ?? "none"
+            if nav != "ok" {
+                _ = try? await js("window.__stale = 1")
+                webView.load(URLRequest(url: sc.url))
+            }
             try await waitApp()
-            page = try await waitForGrid(expectRows: true, tab: Config.tabName)
+            main = try await readTab(sc, tab: Config.tabName, grid: sc.grid, expectRows: true, quick: false)
         }
-        if page.found {
-            hasPiezas = page.hasPiezas
-            debug = page.debug
-            all = page.rows
-            counts = [page.rows.count]
-            let rest = await readRemainingPages(from: page, tab: Config.tabName)
-            all += rest.rows
-            counts += rest.counts
-            if !rest.note.isEmpty { notes.append(rest.note) }
-        } else {
-            debug = (try? await js(diagJS)) as? String ?? ""
-        }
-        let mainCount = all.count
+        var diag = ""
+        if main.page?.found != true { diag = (try? await js(diagJS)) as? String ?? "" }
 
-        // Pestanyes addicionals (Pendientes): per comptar programadors i màquines.
+        var all = main.rows
+        let mainCount = all.count
+        var notes: [String] = []
+        if !main.note.isEmpty { notes.append(main.note) }
+
+        // Pestanyes addicionals (Pendientes a Titanio): només per comptar programadors.
         for tab in sc.extraTabs {
-            activeGrid = tab.grid
-            guard let p0 = try? await waitForGrid(expectRows: false, tab: tab.name, quick: true), p0.found else { continue }
-            all += p0.rows
-            let rest = await readRemainingPages(from: p0, tab: tab.name)
-            all += rest.rows
-            if !rest.note.isEmpty { notes.append(rest.note) }
+            let t = try await readTab(sc, tab: tab.name, grid: tab.grid, expectRows: false, quick: true)
+            all += t.rows
+            if !t.note.isEmpty { notes.append(t.note) }
         }
         activeGrid = sc.grid
-        return ScanResult(rows: all, pageCounts: counts, hasPiezas: hasPiezas, debug: debug,
+        return ScanResult(rows: all, pageCounts: main.counts, hasPiezas: main.page?.hasPiezas ?? false,
+                          debug: main.page?.found == true ? (main.page?.debug ?? "") : diag,
                           expected: expected, mainCount: mainCount, pageNote: notes.joined(separator: " "))
     }
 
-    /// Passa a la pàgina 2, 3… de la taula actual fins que no n'hi ha més. Si una pàgina no es pot carregar,
-    /// no perdem el que ja hem llegit: tornem les files i una nota.
-    private func readRemainingPages(from first: GridPage, tab: String) async -> (rows: [GridRow], counts: [Int], note: String) {
-        var rows: [GridRow] = []
-        var counts: [Int] = []
-        var page = first
+    /// Llegeix una pestanya sencera: obre la pestanya amb el centre correcte i recorre totes les pàgines (de 20 en 20).
+    private func readTab(_ sc: Config.Scan, tab: String, grid: String, expectRows: Bool, quick: Bool) async throws -> TabRead {
+        activeGrid = grid
+        var first: GridPage? = nil
+        for _ in 0..<(quick ? 1 : 3) {
+            try await ensureCenter(sc.center)
+            let p = try await waitForGrid(expectRows: expectRows, tab: tab, quick: quick)
+            // Si el centre ha canviat sol mentre carregava la taula, tornem a començar.
+            if await currentCenter() == sc.center { first = p; break }
+        }
+        guard let page = first, page.found else { return TabRead(page: first, rows: [], counts: [], note: "") }
+
+        var rows = page.rows
+        var counts = [page.rows.count]
+        var cur = page
         var n = 2
         while n <= 80 {
             let target = (try? await js(pageInfoJS(n))) as? String ?? ""
             if target.isEmpty { break }                               // no hi ha pàgina n: hem acabat
-            guard let next = await changePage(to: n, target: target, from: page.sig, tab: tab) else {
+            guard let next = await goToPage(n, target: target, scan: sc, tab: tab, from: cur.sig) else {
                 let d = (try? await js(pagerDiagJS)) as? String ?? ""
-                return (rows, counts, "\(tab): no he pogut passar a la pàgina \(n) [\(d)]")
+                return TabRead(page: page, rows: rows, counts: counts, note: "\(tab): no he pogut passar a la pàgina \(n) [\(d)]")
             }
-            page = next
+            cur = next
             rows += next.rows
             counts.append(next.rows.count)
             n += 1
         }
-        return (rows, counts, "")
+        return TabRead(page: page, rows: rows, counts: counts, note: "")
+    }
+
+    /// Canvia a la pàgina n: abans de cada canvi es torna a posar el centre, i després es comprova que no hagi canviat.
+    private func goToPage(_ n: Int, target: String, scan sc: Config.Scan, tab: String, from sig: String) async -> GridPage? {
+        var from = sig
+        var tgt = target
+        for _ in 0..<3 {
+            // 1) el centre ha de ser el bo ABANS de canviar de pàgina
+            if await currentCenter() != sc.center {
+                guard (try? await switchCenter(to: sc.center)) != nil,
+                      let pg1 = try? await waitForGrid(expectRows: true, tab: tab), pg1.found else { continue }
+                from = pg1.sig                                         // la pàgina s'ha recarregat: som a la 1
+                tgt = (try? await js(pageInfoJS(n))) as? String ?? ""
+                if tgt.isEmpty { return nil }
+            }
+            // 2) canviem de pàgina
+            let p = await changePage(to: n, target: tgt, from: from, tab: tab)
+            // 3) comprovem que el centre no hagi canviat sol durant el canvi
+            if await currentCenter() == sc.center, let p = p { return p }
+        }
+        return nil
     }
 
     private func waitChange(_ sig: String, polls: Int) async -> GridPage? {
@@ -591,14 +623,27 @@ final class Scraper: NSObject, ObservableObject {
         const ids = [...document.querySelectorAll('[id^="' + full + '_GvwGrid_"]')]
           .map(e => e.id.replace(full + '_GvwGrid_', '')).filter(x => /_[0-9]+$/.test(x)).slice(0, 3);
         const txt = t ? (t.textContent || '').replace(/\\s+/g, ' ').trim().slice(0, 40) : '';
-        return g.replace('Phg', '') + '[tr=' + (t ? t.rows.length : '—') + ' ids=' + (ids.join(',') || 'cap') + ' «' + txt + '»]';
+        const r2 = t && t.rows[1] ? (t.rows[1].textContent || '').replace(/\\s+/g, ' ').trim().slice(0, 40) : '';
+        return g.replace('Phg', '') + '[tr=' + (t ? t.rows.length : '—') + ' ids=' + (ids.join(',') || 'cap') + ' 2a-fila=«' + r2 + '»]';
       });
+      const te = document.getElementById('ContentPlaceHolder1_tabDisponibles');
+      const tabHtml = te && te.parentElement ? (te.parentElement.outerHTML || '').replace(/\\s+/g, ' ').slice(0, 220) : 'sense tabDisponibles';
       const tabs = [...document.querySelectorAll('span,a,li,button,div')].filter(e => e.children.length === 0 && /^(pendientes|disponibles|todos)$/i.test((e.textContent || '').trim())).map(e => e.tagName.toLowerCase() + '#' + e.id).slice(0, 6);
-      return 'pàgina ' + location.pathname.split('/').slice(-2).join('/') + ' · llegeixo ' + '\(activeGrid)'.replace(P, '') + ' · ' + info.join(' ') + ' · pestanyes: ' + (tabs.join(', ') || 'cap');
+      return 'pàgina ' + location.pathname.split('/').slice(-2).join('/') + ' · llegeixo ' + '\(activeGrid)'.replace(P, '') + ' · ' + info.join(' ') + ' · pestanyes: ' + (tabs.join(', ') || 'cap') + ' · HTML pestanya: ' + tabHtml;
     })()
     """ }
 
     /// Si existeix l'enllaç a la pàgina n, torna l'objectiu del postback (o 'x'); si no, text buit.
+    private func menuClickJS(_ material: String) -> String { """
+    (() => {
+      const a = document.getElementById('\(Config.menuPrefix)\(material)Prod');
+      if (!a) return 'none';
+      window.__stale = 1;
+      a.click();
+      return 'ok';
+    })()
+    """ }
+
     private func pageInfoJS(_ n: Int) -> String { """
     (() => {
       const H = '\(gridPostbackName)';
