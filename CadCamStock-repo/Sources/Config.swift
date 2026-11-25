@@ -37,9 +37,9 @@ enum Config {
     }
     private static let base = "https://srv-ccmanager.phibo.com:27015/Fases/PhiboGrids/"
     static let scans: [Scan] = [
-        Scan(key: "TiES", grid: "ContentPlaceHolder1_PhgCFDisponibles", short: "Ti ES", label: "Titanio España", center: "España", material: "Titanio", url: URL(string: base + "Titanio/Produccion.aspx")!),
-        Scan(key: "TiOU", grid: "ContentPlaceHolder1_PhgCFDisponibles", short: "Ti OU", label: "Titanio Ourense", center: "Ourense", material: "Titanio", url: URL(string: base + "Titanio/Produccion.aspx")!),
-        Scan(key: "Zr", grid: "ContentPlaceHolder1_PhgDisponibles", short: "Zr", label: "Zirconio Ourense", center: "Ourense", material: "Zirconio", url: URL(string: base + "Zirconio/ZrFaseProd.aspx")!),
+        Scan(key: "TiES", grid: "ContentPlaceHolder1_PhgCFDisponibles", short: "Ti ES", label: "Titani España", center: "España", material: "Titanio", url: URL(string: base + "Titanio/Produccion.aspx")!),
+        Scan(key: "TiOU", grid: "ContentPlaceHolder1_PhgCFDisponibles", short: "Ti OU", label: "Titani Ourense", center: "Ourense", material: "Titanio", url: URL(string: base + "Titanio/Produccion.aspx")!),
+        Scan(key: "Zr", grid: "ContentPlaceHolder1_PhgDisponibles", short: "Zr", label: "Zirconi Ourense", center: "Ourense", material: "Zirconio", url: URL(string: base + "Zirconio/ZrFaseProd.aspx")!),
         Scan(key: "PMMA", grid: "ContentPlaceHolder1_PhgCFDisponibles", short: "PMMA", label: "PMMA Ourense", center: "Ourense", material: "PMMA", url: URL(string: base + "PMMA/PMMAFaseMec.aspx")!),
     ]
 
