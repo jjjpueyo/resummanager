@@ -370,6 +370,14 @@ final class Scraper: NSObject, ObservableObject {
         if await currentCenter() != name { throw ScrapeError(message: "No he pogut posar el centre \(name)") }
     }
 
+    /// Força la sincronització del centre: canvia a l'altre i torna al bo. Si el selector ja diu el centre bo però la web
+    /// treballa amb un altre, només així s'adona del canvi (com quan ho tornes a triar tu a mà).
+    private func forceCenter(_ name: String) async throws {
+        guard let other = Config.centers.first(where: { $0.name != name })?.name else { return }
+        try await switchCenter(to: other)
+        try await switchCenter(to: name)
+    }
+
     /// Carrega la pàgina de Fase Mecanizado d'un material i en llegeix la pestanya Disponibles (totes les pàgines)
     /// més les pestanyes addicionals que toquin, vigilant sempre que el centre sigui el bo.
     private func readScan(_ sc: Config.Scan) async throws -> ScanResult {
@@ -380,16 +388,32 @@ final class Scraper: NSObject, ObservableObject {
         let expectRows = (expected ?? 1) > 0
 
         var main = try await readTab(sc, tab: Config.tabName, grid: sc.grid, expectRows: expectRows, quick: false)
-        if main.page?.found != true && (expected ?? 0) > 0 {
-            // El menú diu que hi ha fitxers però la taula no ha sortit: ho reintentem una vegada navegant
-            // com ho fa una persona (clic a l'enllaç del menú) i, si no hi és, recarregant la URL.
-            let nav = (try? await js(menuClickJS(sc.material))) as? String ?? "none"
-            if nav != "ok" {
-                _ = try? await js("window.__stale = 1")
-                webView.load(URLRequest(url: sc.url))
+
+        // Si els fitxers llegits no coincideixen amb els del menú, reintentem de dues maneres i ens quedem amb
+        // la lectura que més s'hi acosta.
+        if let e = expected, main.rows.count != e {
+            var best = main
+            // 1) forcem la sincronització del centre (canviar a l'altre i tornar) i tornem a llegir
+            do {
+                try await forceCenter(sc.center)
+                let r1 = try await readTab(sc, tab: Config.tabName, grid: sc.grid, expectRows: expectRows, quick: false)
+                if abs(r1.rows.count - e) < abs(best.rows.count - e) { best = r1 }
+            } catch {}
+            // 2) naveguem com ho fa una persona (clic a l'enllaç "Fase Mecanizado" del menú) i tornem a posar el centre
+            if best.rows.count != e {
+                do {
+                    let nav = (try? await js(menuClickJS(sc.material))) as? String ?? "none"
+                    if nav != "ok" {
+                        _ = try? await js("window.__stale = 1")
+                        webView.load(URLRequest(url: sc.url))
+                    }
+                    try await waitApp()
+                    try await forceCenter(sc.center)
+                    let r2 = try await readTab(sc, tab: Config.tabName, grid: sc.grid, expectRows: true, quick: false)
+                    if abs(r2.rows.count - e) < abs(best.rows.count - e) { best = r2 }
+                } catch {}
             }
-            try await waitApp()
-            main = try await readTab(sc, tab: Config.tabName, grid: sc.grid, expectRows: true, quick: false)
+            main = best
         }
         var diag = ""
         if main.page?.found != true { diag = (try? await js(diagJS)) as? String ?? "" }
