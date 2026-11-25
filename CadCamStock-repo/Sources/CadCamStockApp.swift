@@ -279,7 +279,6 @@ struct MachinesCard: View {
     let loading: Bool
     let expectedFiles: Int?
 
-    private var totalPieces: Int { summary?.stats.reduce(0) { $0 + $1.pieces } ?? 0 }
     private var totalFiles: Int { summary?.stats.reduce(0) { $0 + $1.cases } ?? 0 }
 
     private func color(_ m: String) -> Color {
@@ -299,7 +298,7 @@ struct MachinesCard: View {
                     .foregroundStyle(.secondary)
                 Spacer()
                 if summary != nil {
-                    Text("\(totalPieces) peces")
+                    Text("\(totalFiles) fitxers")
                         .font(.title3.weight(.heavy))
                 }
             }
@@ -307,7 +306,7 @@ struct MachinesCard: View {
                 HStack(spacing: 10) {
                     ForEach(s.stats) { st in
                         VStack(spacing: 2) {
-                            Text("\(st.pieces)")
+                            Text("\(st.cases)")
                                 .font(.system(size: 40, weight: .heavy, design: .rounded))
                                 .foregroundStyle(color(st.machine))
                                 .lineLimit(1)
@@ -316,7 +315,7 @@ struct MachinesCard: View {
                                 .font(.footnote.weight(.bold))
                                 .lineLimit(1)
                                 .minimumScaleFactor(0.6)
-                            Text("peces")
+                            Text("fitxers")
                                 .font(.caption2)
                                 .foregroundStyle(.secondary)
                         }
