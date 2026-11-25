@@ -79,6 +79,9 @@ final class Scraper: NSObject, ObservableObject {
     @Published var needsManualLogin = false   // mostra la web perquè facis login tu
 
     let webView: WKWebView
+    private var abortRequested = false              // l'app torna de segon pla: la lectura en curs s'ha d'aturar
+    private var webProcessDied = false
+    private var statusBase = ""                    // text de la fase en curs (els detalls hi afegeixen coses)
     private var zrRows: [GridRow]? = nil              // files de Zirconi (Disponibles), llegides a la fase de màquines
     private var got: [String: CenterResult] = [:]   // números per centre, llegits dels menús
     private var activeGrid = ""          // taula que s'està llegint ara (varia segons la pàgina)
@@ -104,7 +107,50 @@ final class Scraper: NSObject, ObservableObject {
     func refresh() async {
         guard !isLoading else { return }
         isLoading = true
-        defer { isLoading = false }
+        abortRequested = false
+        defer { isLoading = false; abortRequested = false }
+        for attempt in 0..<2 {
+            do {
+                try await performRefresh()
+                status = ""
+                return
+            } catch {
+                if abortRequested { status = ""; return }
+                if attempt == 0 {
+                    // Com tancar i tornar a obrir l'app: esborrem la sessió i tornem a començar des de zero.
+                    status = "Tornant a connectar…"
+                    await resetSession()
+                } else {
+                    status = error.localizedDescription
+                }
+            }
+        }
+    }
+
+    /// En tornar de segon pla: si hi havia una lectura en curs (potser congelada), l'aturem i en comencem una de neta.
+    func resumeFromBackground() async {
+        if isLoading {
+            abortRequested = true
+            for _ in 0..<250 {                                   // fins a ~25 s perquè la lectura vella acabi
+                if !isLoading { break }
+                _ = try? await Task.sleep(nanoseconds: 100_000_000)
+            }
+        } else if let d = lastUpdate, Date().timeIntervalSince(d) < 20 {
+            return                                               // ja és ben fresca
+        }
+        await refresh()
+    }
+
+    /// Esborra la sessió de la web (galetes i dades), com si l'app s'hagués tancat i tornat a obrir.
+    private func resetSession() async {
+        webView.stopLoading()
+        await WKWebsiteDataStore.default().removeData(ofTypes: WKWebsiteDataStore.allWebsiteDataTypes(),
+                                                      modifiedSince: Date(timeIntervalSince1970: 0))
+        webView.load(URLRequest(url: URL(string: "about:blank")!))
+        _ = try? await Task.sleep(nanoseconds: 400_000_000)
+    }
+
+    private func performRefresh() async throws {
         do {
             status = "Connectant…"
             // Marca la pàgina actual com a "vella": no llegirem res fins que carregui la nova.
@@ -113,7 +159,7 @@ final class Scraper: NSObject, ObservableObject {
             try await ensureLoggedIn()
 
             got = [:]
-            status = "Llegint dades…"
+            status = "Actualitzant totals…"
             // 1) Els números es llegeixen SEMPRE de la pàgina d'entrada (com abans): primer el centre on som...
             let start = await currentCenter() ?? ""
             guard await captureCounts() != nil else {
@@ -121,7 +167,7 @@ final class Scraper: NSObject, ObservableObject {
             }
             // 2) ...i després l'altre, canviant el selector sobre aquesta mateixa pàgina.
             for c in Config.centers where c.name != start {
-                status = "Llegint \(c.name)…"
+                status = "Actualitzant totals · \(c.name)…"
                 try await switchCenter(to: c.name)
                 guard await captureCounts() != nil else {
                     throw ScrapeError(message: "No s'han pogut llegir dades de \(c.name)")
@@ -139,8 +185,6 @@ final class Scraper: NSObject, ObservableObject {
             lastUpdate = Date()
             saveCache()
             status = ""
-        } catch {
-            status = error.localizedDescription
         }
     }
 
@@ -149,6 +193,7 @@ final class Scraper: NSObject, ObservableObject {
     // si no entra en ~15 s, mostrem la web perquè facis el login a mà (un cop).
     private func ensureLoggedIn() async throws {
         var submittedAt: Int? = nil, lastPortal = -100, portalDone = false, portalTries = 0
+        var strayCount = 0, clearedOnce = false
         defer { needsManualLogin = false }
         for i in 0..<600 {                                  // ~2 min
             let s = (try? await js(Self.stateJS)) as? String ?? "wait"
@@ -196,6 +241,16 @@ final class Scraper: NSObject, ObservableObject {
                         // Ja hem passat pel portal: ara sí, anem a la pàgina de fases
                         webView.load(URLRequest(url: Config.cadcamURL))
                     }
+                }
+            case "other" where submittedAt == nil:
+                // Ni login ni l'app (p. ex. una sessió vella o caducada): als ~12 s esborrem la sessió i tornem a començar.
+                strayCount += 1
+                if strayCount > 60 && !clearedOnce {
+                    clearedOnce = true
+                    strayCount = 0
+                    await resetSession()
+                    _ = try? await js("window.__stale = 1")
+                    webView.load(URLRequest(url: Config.cadcamURL))
                 }
             default: break
             }
@@ -280,7 +335,8 @@ final class Scraper: NSObject, ObservableObject {
     private func updateMachines() async {
         machinesNote = ""
         guard let sc = Config.scans.first(where: { $0.key == Config.zirconiKey }) else { return }
-        status = "Llegint màquines de Zirconi…"
+        statusBase = "Identificant Zirconi: Datron o IMES i programadors"
+        status = statusBase + "…"
         do {
             let r = try await readScan(sc)
             let rows = Array(r.rows.prefix(r.mainCount))
@@ -305,6 +361,7 @@ final class Scraper: NSObject, ObservableObject {
             machinesNote = error.localizedDescription
         }
         saveCache()
+        statusBase = ""
         status = ""
     }
 
@@ -349,7 +406,8 @@ final class Scraper: NSObject, ObservableObject {
 
         for key in keys {
             guard let sc = Config.scans.first(where: { $0.key == key }) else { continue }
-            status = "Llegint \(sc.label)…"
+            statusBase = "Verificant programadors · \(sc.label)"
+            status = statusBase + "…"
             do {
                 let r = try await readScan(sc)
                 // Si no s'ha pogut llegir res tot i que el menú diu que hi ha fitxers, no esborrem la columna.
@@ -367,6 +425,7 @@ final class Scraper: NSObject, ObservableObject {
             }
             publish()                                   // la taula es refresca amb aquest material
         }
+        statusBase = ""
         status = ""
     }
 
@@ -417,6 +476,7 @@ final class Scraper: NSObject, ObservableObject {
         // Si els fitxers llegits no coincideixen amb els del menú, reintentem de dues maneres i ens quedem amb
         // la lectura que més s'hi acosta.
         if let e = expected, main.rows.count != e {
+            if !statusBase.isEmpty { status = "\(statusBase) · tornant a comprovar…" }
             var best = main
             // 1) forcem la sincronització del centre (canviar a l'altre i tornar) i tornem a llegir
             do {
@@ -479,6 +539,7 @@ final class Scraper: NSObject, ObservableObject {
         while n <= 80 {
             let target = (try? await js(pageInfoJS(n))) as? String ?? ""
             if target.isEmpty { break }                               // no hi ha pàgina n: hem acabat
+            if !statusBase.isEmpty { status = "\(statusBase) · pàg. \(n)…" }
             guard let next = await goToPage(n, target: target, scan: sc, tab: tab, from: cur.sig) else {
                 let d = (try? await js(pagerDiagJS)) as? String ?? ""
                 return TabRead(page: page, rows: rows, counts: counts, note: "\(tab): no he pogut passar a la pàgina \(n) [\(d)]")
@@ -770,8 +831,23 @@ final class Scraper: NSObject, ObservableObject {
     })()
     """
 
-    private func js(_ code: String) async throws -> Any? {
-        try await webView.evaluateJavaScript(code)
+    private func js(_ code: String, timeout: TimeInterval = 20) async throws -> Any? {
+        if abortRequested { throw ScrapeError(message: "Cancel·lat") }
+        return try await withCheckedThrowingContinuation { (cont: CheckedContinuation<Any?, Error>) in
+            var finished = false
+            func finish(_ result: Result<Any?, Error>) {
+                if finished { return }
+                finished = true
+                cont.resume(with: result)
+            }
+            webView.evaluateJavaScript(code) { value, error in
+                if let error = error { finish(.failure(error)) } else { finish(.success(value)) }
+            }
+            // Si la web es queda congelada, no esperem per sempre.
+            DispatchQueue.main.asyncAfter(deadline: .now() + timeout) {
+                finish(.failure(ScrapeError(message: "La web no respon")))
+            }
+        }
     }
 
     /// Converteix un valor Swift en literal JavaScript segur.
@@ -801,6 +877,8 @@ extension Scraper: WKUIDelegate {
 // iOS pot matar el procés de la web quan l'app és en segon pla: la recarreguem.
 extension Scraper: WKNavigationDelegate {
     func webViewWebContentProcessDidTerminate(_ webView: WKWebView) {
-        webView.reload()
+        // iOS pot aturar la web en segon pla. No la recarreguem aquí (feia cursa amb l'actualització):
+        // la propera lectura sempre comença carregant la seva pròpia pàgina.
+        webProcessDied = true
     }
 }
