@@ -309,11 +309,40 @@ final class Scraper: NSObject, ObservableObject {
     }
 
     // MARK: - Fase 3: programadors (és la que més triga: ha de recórrer tots els materials i centres)
+    /// La taula s'actualitza cada vegada que acaba de llegir un material. Cada columna només es canvia quan ja té
+    /// la lectura nova; mentre no la té, conserva l'últim valor guardat.
     private func updateProgrammers() async {
         programmersNote = ""
-        var rowsByKey: [String: [GridRow]] = [:]
         var notes: [String] = []
-        if let z = zrRows { rowsByKey[Config.zirconiKey] = z }       // Zirconi ja llegit a la fase anterior
+
+        // Punt de partida: la taula guardada (clau de material -> sigles -> fitxers)
+        var countsByKey: [String: [String: Int]] = [:]
+        for st in programmers?.stats ?? [] {
+            for (key, n) in st.counts { countsByKey[key, default: [:]][st.initials] = n }
+        }
+        func tally(_ rows: [GridRow]) -> [String: Int] {
+            var d: [String: Int] = [:]
+            for r in rows where !r.prog.isEmpty { d[r.prog, default: 0] += 1 }
+            return d
+        }
+        func publish() {
+            var byProg: [String: [String: Int]] = [:]
+            for (key, perProg) in countsByKey {
+                for (p, n) in perProg where n > 0 { byProg[p, default: [:]][key] = n }
+            }
+            let stats = byProg.map { ProgrammerStat(initials: $0.key, counts: $0.value) }
+                .sorted { ($0.total, $1.initials) > ($1.total, $0.initials) }
+            programmers = ProgrammerSummary(stats: stats, date: Date())
+            programmersNote = notes.joined(separator: "\n")
+            saveCache()
+        }
+
+        // Zirconi ja s'ha llegit a la fase anterior: surt a la taula de seguida.
+        if let z = zrRows {
+            countsByKey[Config.zirconiKey] = tally(z)
+            publish()
+        }
+
         // Primer el que és d'Ourense (ja hi som) i España al final.
         var keys = ["TiOU", "PMMA", "TiES"]
         if zrRows == nil { keys.insert(Config.zirconiKey, at: 0) }
@@ -323,7 +352,9 @@ final class Scraper: NSObject, ObservableObject {
             status = "Llegint \(sc.label)…"
             do {
                 let r = try await readScan(sc)
-                rowsByKey[key] = r.rows
+                // Si no s'ha pogut llegir res tot i que el menú diu que hi ha fitxers, no esborrem la columna.
+                let readFailed = r.mainCount == 0 && (r.expected ?? 0) > 0
+                if !readFailed { countsByKey[key] = tally(r.rows) }
                 if !r.pageNote.isEmpty { notes.append("\(sc.label): " + r.pageNote) }
                 if let e = r.expected, e != r.mainCount {
                     var m = "\(sc.label): he llegit \(r.mainCount) fitxers i el menú en diu \(e)."
@@ -334,19 +365,8 @@ final class Scraper: NSObject, ObservableObject {
             } catch {
                 notes.append("\(sc.label): \(error.localizedDescription)")
             }
+            publish()                                   // la taula es refresca amb aquest material
         }
-
-        var byProg: [String: [String: Int]] = [:]
-        for (key, rows) in rowsByKey {
-            for r in rows where !r.prog.isEmpty {
-                byProg[r.prog, default: [:]][key, default: 0] += 1
-            }
-        }
-        let stats = byProg.map { ProgrammerStat(initials: $0.key, counts: $0.value) }
-            .sorted { ($0.total, $1.initials) > ($1.total, $0.initials) }
-        if !stats.isEmpty { programmers = ProgrammerSummary(stats: stats, date: Date()) }
-        programmersNote = notes.joined(separator: "\n")
-        saveCache()
         status = ""
     }
 
