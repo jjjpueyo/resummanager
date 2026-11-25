@@ -381,10 +381,15 @@ final class Scraper: NSObject, ObservableObject {
     /// Carrega la pàgina de Fase Mecanizado d'un material i en llegeix la pestanya Disponibles (totes les pàgines)
     /// més les pestanyes addicionals que toquin, vigilant sempre que el centre sigui el bo.
     private func readScan(_ sc: Config.Scan) async throws -> ScanResult {
+        let expected = expectedFiles(sc)
+        if expected == 0 {
+            // El menú diu que no hi ha cap fitxer en mecanitzat: no cal ni carregar la pàgina (estalvia temps).
+            return ScanResult(rows: [], pageCounts: [], hasPiezas: true, debug: "",
+                              expected: 0, mainCount: 0, pageNote: "")
+        }
         _ = try? await js("window.__stale = 1")
         webView.load(URLRequest(url: sc.url))
         try await waitApp()
-        let expected = expectedFiles(sc)
         let expectRows = (expected ?? 1) > 0
 
         var main = try await readTab(sc, tab: Config.tabName, grid: sc.grid, expectRows: expectRows, quick: false)
