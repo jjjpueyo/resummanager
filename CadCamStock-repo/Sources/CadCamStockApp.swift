@@ -33,6 +33,7 @@ private extension View {
 struct ContentView: View {
     @StateObject private var scraper = Scraper()
     @State private var showSettings = false
+    @State private var wentToBackground = false
     @Environment(\.scenePhase) private var scenePhase
 
     var body: some View {
@@ -51,10 +52,16 @@ struct ContentView: View {
         }
         .task { await Task { await scraper.refresh() }.value }
         .onChange(of: scenePhase) { phase in
-            // En tornar a l'app des del segon pla, actualitza (si l'última lectura té > 20 s)
+            if phase == .background { wentToBackground = true; return }
             guard phase == .active else { return }
-            if let d = scraper.lastUpdate, Date().timeIntervalSince(d) < 20 { return }
-            Task { await scraper.refresh() }
+            if wentToBackground {
+                // Tornem de segon pla: aturem qualsevol lectura vella i en comencem una de neta.
+                wentToBackground = false
+                Task { await scraper.resumeFromBackground() }
+            } else {
+                if let d = scraper.lastUpdate, Date().timeIntervalSince(d) < 20 { return }
+                Task { await scraper.refresh() }
+            }
         }
         .sheet(isPresented: $showSettings) { SettingsView() }
         .preferredColorScheme(.dark)
@@ -129,6 +136,7 @@ struct HeaderView: View {
                     .font(.footnote)
                     .foregroundStyle(.secondary)
                     .lineLimit(1)
+                    .minimumScaleFactor(0.75)
             }
             Rectangle()
                 .fill(LinearGradient(colors: [Theme.prog.opacity(0.7), Color.white.opacity(0.05)],
